@@ -6,7 +6,9 @@ pub struct RingBuffer<T> {
 }
 
 impl<T> RingBuffer<T> {
+  #[must_use]
   pub fn new(capacity: usize) -> Self {
+    assert!(capacity > 0, "RingBuffer capacity must be greater than 0");
     Self {
       capacity,
       inner: VecDeque::with_capacity(capacity),
@@ -58,5 +60,11 @@ mod tests {
     buffer.push(4); // Evicts 2
     let items: Vec<_> = buffer.iter().copied().collect();
     assert_eq!(items, vec![3, 4]);
+  }
+
+  #[test]
+  #[should_panic(expected = "RingBuffer capacity must be greater than 0")]
+  fn test_zero_capacity_panics() {
+    let _ = RingBuffer::<i32>::new(0);
   }
 }

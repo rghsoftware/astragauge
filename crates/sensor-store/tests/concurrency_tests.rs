@@ -1,26 +1,12 @@
-use astragauge_domain::{SensorDescriptor, SensorId, SensorSample};
+use astragauge_domain::SensorId;
 use astragauge_sensor_store::{SensorStore, SubscriptionManager};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-fn make_descriptor(id: &str) -> SensorDescriptor {
-  SensorDescriptor {
-    id: SensorId::new(id).unwrap(),
-    name: format!("{} sensor", id),
-    category: "test".to_string(),
-    unit: "unit".to_string(),
-    device: None,
-    tags: vec![],
-  }
-}
+mod common;
 
-fn make_sample(id: &str, timestamp_ms: u64, value: Option<f64>) -> SensorSample {
-  SensorSample {
-    sensor_id: SensorId::new(id).unwrap(),
-    timestamp_ms,
-    value,
-  }
-}
+#[allow(unused_imports)]
+use common::{make_descriptor, make_sample};
 
 #[tokio::test]
 async fn test_concurrent_reads_dont_block() {

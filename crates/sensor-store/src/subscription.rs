@@ -1,73 +1,109 @@
-use crate::pattern::match_pattern;
+use crate::pattern::matches_single;
 use astragauge_domain::{SensorId, SensorSample};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
+
+static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriptionId(u64);
 
 /// Manages broadcast subscriptions for sensor samples
 pub struct SubscriptionManager {
   subscribers: HashMap<String, broadcast::Sender<SensorSample>>,
+  subscription_patterns: HashMap<SubscriptionId, String>,
   default_capacity: usize,
 }
 
 /// A subscription to receive sensor samples matching a pattern
 pub struct Subscription {
+  id: SubscriptionId,
   receiver: broadcast::Receiver<SensorSample>,
-  pub pattern: String,
+  pattern: String,
 }
 
 impl SubscriptionManager {
-  /// Create a new SubscriptionManager with default channel capacity (256)
+  #[must_use]
   pub fn new() -> Self {
     Self::with_capacity(256)
   }
 
-  /// Create a new SubscriptionManager with specified channel capacity
+  #[must_use]
   pub fn with_capacity(capacity: usize) -> Self {
     Self {
       subscribers: HashMap::new(),
+      subscription_patterns: HashMap::new(),
       default_capacity: capacity,
     }
   }
 
-  /// Subscribe to samples matching the given pattern
   pub fn subscribe(&mut self, pattern: &str) -> Subscription {
+    let id = SubscriptionId(NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed));
     let sender = self
       .subscribers
       .entry(pattern.to_string())
       .or_insert_with(|| broadcast::channel(self.default_capacity).0);
 
+    self.subscription_patterns.insert(id, pattern.to_string());
+
     Subscription {
+      id,
       receiver: sender.subscribe(),
       pattern: pattern.to_string(),
     }
   }
 
-  /// Notify all matching subscriptions of a new sample
+  pub fn unsubscribe(&mut self, id: SubscriptionId) {
+    if let Some(pattern) = self.subscription_patterns.remove(&id) {
+      if let Some(sender) = self.subscribers.get(&pattern) {
+        if sender.receiver_count() == 0 {
+          self.subscribers.remove(&pattern);
+        }
+      }
+    }
+  }
+
+  pub fn cleanup_empty_patterns(&mut self) {
+    self
+      .subscribers
+      .retain(|_, sender| sender.receiver_count() > 0);
+  }
+
   pub fn notify(&self, sample: &SensorSample, matches: impl Fn(&str, &SensorId) -> bool) {
     for (pattern, sender) in &self.subscribers {
       if matches(pattern, &sample.sensor_id) {
-        // Ignore lagged errors - slow subscribers will miss messages
         let _ = sender.send(sample.clone());
       }
     }
   }
 
-  /// Notify subscriptions matching the sample's sensor ID using pattern matching.
-  ///
-  /// This is a convenience method that uses [`match_pattern`] internally.
-  /// For custom matching logic, use [`notify`](Self::notify) with a custom closure.
   pub fn notify_matching(&self, sample: &SensorSample) {
     for (pattern, sender) in &self.subscribers {
-      let matching = match_pattern(pattern, std::slice::from_ref(&sample.sensor_id));
-      if !matching.is_empty() {
+      if matches_single(pattern, &sample.sensor_id) {
         let _ = sender.send(sample.clone());
       }
     }
+  }
+
+  pub fn subscription_count(&self) -> usize {
+    self.subscription_patterns.len()
+  }
+
+  pub fn pattern_count(&self) -> usize {
+    self.subscribers.len()
   }
 }
 
 impl Subscription {
-  /// Receive the next sample from this subscription
+  pub fn id(&self) -> SubscriptionId {
+    self.id
+  }
+
+  pub fn pattern(&self) -> &str {
+    &self.pattern
+  }
+
   pub async fn recv(&mut self) -> Result<SensorSample, broadcast::error::RecvError> {
     self.receiver.recv().await
   }
@@ -108,8 +144,42 @@ mod tests {
     let _sub1 = manager.subscribe("cpu.*");
     let sub2 = manager.subscribe("cpu.*");
 
-    assert_eq!(sub2.pattern, "cpu.*");
+    assert_eq!(sub2.pattern(), "cpu.*");
     assert_eq!(manager.subscribers.len(), 1);
+  }
+
+  #[test]
+  fn test_subscription_has_unique_id() {
+    let mut manager = SubscriptionManager::new();
+    let sub1 = manager.subscribe("cpu.*");
+    let sub2 = manager.subscribe("cpu.*");
+    let sub3 = manager.subscribe("gpu.*");
+
+    assert_ne!(sub1.id(), sub2.id());
+    assert_ne!(sub2.id(), sub3.id());
+  }
+
+  #[test]
+  fn test_unsubscribe_removes_tracking() {
+    let mut manager = SubscriptionManager::new();
+    let sub = manager.subscribe("cpu.*");
+    let id = sub.id();
+
+    assert_eq!(manager.subscription_count(), 1);
+    drop(sub);
+    manager.unsubscribe(id);
+    assert_eq!(manager.subscription_count(), 0);
+  }
+
+  #[test]
+  fn test_cleanup_empty_patterns() {
+    let mut manager = SubscriptionManager::new();
+    {
+      let _sub = manager.subscribe("cpu.*");
+      assert_eq!(manager.pattern_count(), 1);
+    }
+    manager.cleanup_empty_patterns();
+    assert_eq!(manager.pattern_count(), 0);
   }
 
   #[tokio::test]

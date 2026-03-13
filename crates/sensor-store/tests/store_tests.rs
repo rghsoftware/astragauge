@@ -1,24 +1,10 @@
-use astragauge_domain::{SensorDescriptor, SensorId, SensorSample};
+use astragauge_domain::SensorId;
 use astragauge_sensor_store::{SensorStore, StoreConfig, StoreError};
 
-fn make_descriptor(id: &str) -> SensorDescriptor {
-  SensorDescriptor {
-    id: SensorId::new(id).unwrap(),
-    name: format!("{} sensor", id),
-    category: "test".to_string(),
-    unit: "unit".to_string(),
-    device: None,
-    tags: vec![],
-  }
-}
+mod common;
 
-fn make_sample(id: &str, timestamp_ms: u64, value: Option<f64>) -> SensorSample {
-  SensorSample {
-    sensor_id: SensorId::new(id).unwrap(),
-    timestamp_ms,
-    value,
-  }
-}
+#[allow(unused_imports)]
+use common::{make_descriptor, make_sample};
 
 #[tokio::test]
 async fn test_register_sensor_stores_descriptor() {
@@ -198,10 +184,9 @@ async fn test_old_sample_is_stale() {
 
 #[tokio::test]
 async fn test_staleness_threshold_configurable() {
-  let config = StoreConfig {
-    history_capacity: 120,
-    staleness_threshold_ms: 10000,
-  };
+  let config = StoreConfig::new()
+    .with_history_capacity(120)
+    .with_staleness_threshold_ms(10000);
   let store = SensorStore::with_config(config);
   let id = SensorId::new("cpu.temperature").unwrap();
   store
@@ -261,10 +246,9 @@ async fn test_push_sample_adds_to_history() {
 
 #[tokio::test]
 async fn test_history_respects_capacity() {
-  let config = StoreConfig {
-    history_capacity: 5,
-    staleness_threshold_ms: 5000,
-  };
+  let config = StoreConfig::new()
+    .with_history_capacity(5)
+    .with_staleness_threshold_ms(5000);
   let store = SensorStore::with_config(config);
   let id = SensorId::new("cpu.temperature").unwrap();
   store

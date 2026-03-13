@@ -6,9 +6,29 @@ use tokio::sync::RwLock;
 use crate::{RingBuffer, StoreError, StoreResult};
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StoreConfig {
   pub history_capacity: usize,
   pub staleness_threshold_ms: u64,
+}
+
+impl StoreConfig {
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  #[must_use]
+  pub fn with_history_capacity(mut self, capacity: usize) -> Self {
+    self.history_capacity = capacity;
+    self
+  }
+
+  #[must_use]
+  pub fn with_staleness_threshold_ms(mut self, threshold_ms: u64) -> Self {
+    self.staleness_threshold_ms = threshold_ms;
+    self
+  }
 }
 
 impl Default for StoreConfig {
@@ -34,10 +54,12 @@ pub struct SensorStore {
 }
 
 impl SensorStore {
+  #[must_use]
   pub fn new() -> Self {
     Self::with_config(StoreConfig::default())
   }
 
+  #[must_use]
   pub fn with_config(config: StoreConfig) -> Self {
     Self {
       inner: Arc::new(RwLock::new(SensorStoreInner {
@@ -59,6 +81,15 @@ impl SensorStore {
     Ok(())
   }
 
+  pub async fn unregister_sensor(&self, id: &SensorId) -> StoreResult<()> {
+    let mut store = self.inner.write().await;
+    store.descriptors.remove(id);
+    store.values.remove(id);
+    store.last_update.remove(id);
+    store.history.remove(id);
+    Ok(())
+  }
+
   pub async fn get_descriptor(&self, id: &SensorId) -> Option<SensorDescriptor> {
     let store = self.inner.read().await;
     store.descriptors.get(id).cloned()
@@ -71,7 +102,18 @@ impl SensorStore {
 
   pub async fn push_sample(&self, sample: SensorSample) -> StoreResult<()> {
     let mut store = self.inner.write().await;
+    Self::push_sample_inner(&mut store, sample)
+  }
 
+  pub async fn push_samples(&self, samples: &[SensorSample]) -> StoreResult<()> {
+    let mut store = self.inner.write().await;
+    for sample in samples {
+      Self::push_sample_inner(&mut store, sample.clone())?;
+    }
+    Ok(())
+  }
+
+  fn push_sample_inner(store: &mut SensorStoreInner, sample: SensorSample) -> StoreResult<()> {
     if !store.descriptors.contains_key(&sample.sensor_id) {
       return Err(StoreError::UnknownSensor {
         id: sample.sensor_id.clone(),

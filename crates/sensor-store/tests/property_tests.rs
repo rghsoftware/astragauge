@@ -1,25 +1,11 @@
-use astragauge_domain::{SensorDescriptor, SensorId, SensorSample};
+use astragauge_domain::SensorId;
 use astragauge_sensor_store::{match_pattern, RingBuffer, SensorStore, StoreConfig};
 use proptest::prelude::*;
 
-fn make_descriptor(id: &str) -> SensorDescriptor {
-  SensorDescriptor {
-    id: SensorId::new(id).unwrap(),
-    name: format!("{} sensor", id),
-    category: "test".to_string(),
-    unit: "unit".to_string(),
-    device: None,
-    tags: vec![],
-  }
-}
+mod common;
 
-fn make_sample(id: &str, timestamp_ms: u64, value: Option<f64>) -> SensorSample {
-  SensorSample {
-    sensor_id: SensorId::new(id).unwrap(),
-    timestamp_ms,
-    value,
-  }
-}
+#[allow(unused_imports)]
+use common::{make_descriptor, make_sample};
 
 proptest! {
   #[test]
@@ -116,10 +102,9 @@ proptest! {
   ) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-      let config = StoreConfig {
-        history_capacity: 120,
-        staleness_threshold_ms,
-      };
+      let config = StoreConfig::new()
+        .with_history_capacity(120)
+        .with_staleness_threshold_ms(staleness_threshold_ms);
       let store = SensorStore::with_config(config);
       let id = SensorId::new("cpu.temperature").unwrap();
 
@@ -180,10 +165,9 @@ proptest! {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
       let staleness_threshold_ms = 5000u64;
-      let config = StoreConfig {
-        history_capacity: 120,
-        staleness_threshold_ms,
-      };
+      let config = StoreConfig::new()
+        .with_history_capacity(120)
+        .with_staleness_threshold_ms(staleness_threshold_ms);
       let store = SensorStore::with_config(config);
       let id = SensorId::new("cpu.temperature").unwrap();
 

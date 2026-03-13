@@ -82,20 +82,53 @@ fn match_segment(pattern: &str, segment: &str) -> bool {
   if pattern == "*" {
     true
   } else if pattern.contains('*') {
-    let parts: Vec<&str> = pattern.split('*').collect();
+    // Split on '*' - this can produce 1, 2, or more parts
+    // 1 part: pattern was "*" (already handled above) or empty (invalid)
+    // 2 parts: prefix*suffix patterns (including empty prefix/suffix)
+    // 3+ parts: multiple wildcards in segment - not supported
+    let (prefix, suffix) = pattern.split_once('*').unwrap_or(("", ""));
 
-    match parts.len() {
-      1 => pattern == segment,
-      2 => {
-        let prefix = parts[0];
-        let suffix = parts[1];
-        segment.starts_with(prefix) && segment.ends_with(suffix)
-      }
-      _ => false,
+    // If there are more wildcards, not supported
+    if suffix.contains('*') {
+      return false;
     }
+
+    segment.starts_with(prefix) && segment.ends_with(suffix)
   } else {
     pattern == segment
   }
+}
+
+/// Checks if a single sensor ID matches the pattern.
+///
+/// This is an allocation-free alternative to [`match_pattern`] when checking
+/// a single ID against a pattern, avoiding the Vec allocation.
+///
+/// # Arguments
+///
+/// * `pattern` - The wildcard pattern to match
+/// * `sensor_id` - The sensor ID to test
+///
+/// # Returns
+///
+/// `true` if the sensor ID matches the pattern
+pub fn matches_single(pattern: &str, sensor_id: &SensorId) -> bool {
+  if pattern.is_empty() {
+    return false;
+  }
+
+  let id_str = sensor_id.as_str();
+  let pattern_segments: Vec<&str> = pattern.split('.').collect();
+  let id_segments: Vec<&str> = id_str.split('.').collect();
+
+  if pattern_segments.len() != id_segments.len() {
+    return false;
+  }
+
+  pattern_segments
+    .iter()
+    .zip(id_segments.iter())
+    .all(|(p, s)| match_segment(p, s))
 }
 
 #[cfg(test)]
@@ -219,5 +252,32 @@ mod tests {
     assert_eq!(result[0].as_str(), "cpu.core1.temperature");
     assert_eq!(result[1].as_str(), "cpu.core0.temperature");
     assert_eq!(result[2].as_str(), "cpu.core2.temperature");
+  }
+
+  #[test]
+  fn test_matches_single_exact() {
+    let id = make_id("cpu.temperature");
+    assert!(matches_single("cpu.temperature", &id));
+    assert!(!matches_single("gpu.temperature", &id));
+  }
+
+  #[test]
+  fn test_matches_single_wildcard() {
+    let id = make_id("cpu.core0.temperature");
+    assert!(matches_single("cpu.*.temperature", &id));
+    assert!(matches_single("cpu.core*.temperature", &id));
+    assert!(!matches_single("gpu.*.temperature", &id));
+  }
+
+  #[test]
+  fn test_matches_single_empty_pattern() {
+    let id = make_id("cpu.temperature");
+    assert!(!matches_single("", &id));
+  }
+
+  #[test]
+  fn test_matches_single_different_segment_count() {
+    let id = make_id("cpu.temperature");
+    assert!(!matches_single("cpu.*.temperature", &id));
   }
 }
