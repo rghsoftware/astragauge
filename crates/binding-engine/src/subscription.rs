@@ -6,6 +6,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
+/// Default capacity for the broadcast notification channel.
+///
+/// This value balances memory usage against the ability to handle burst updates.
+/// When the channel is full, slow receivers will miss notifications (lagging behavior).
+pub const DEFAULT_NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
+
 /// Notification sent when a binding value changes.
 #[derive(Debug, Clone)]
 pub struct BindingNotification {
@@ -31,7 +37,7 @@ impl BindingSubscription {
   /// Creates a new `BindingSubscription` with the given engine.
   #[must_use]
   pub fn new(engine: BindingEngine) -> Self {
-    let (notifier, _) = broadcast::channel(256);
+    let (notifier, _) = broadcast::channel(DEFAULT_NOTIFICATION_CHANNEL_CAPACITY);
     Self {
       engine,
       bindings: Arc::new(RwLock::new(HashMap::new())),
@@ -140,6 +146,16 @@ impl Clone for BindingSubscription {
       bindings: Arc::clone(&self.bindings),
       notifier: self.notifier.clone(),
     }
+  }
+}
+
+impl std::fmt::Debug for BindingSubscription {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("BindingSubscription")
+      .field("engine", &"BindingEngine { .. }")
+      .field("bindings", &"Arc<RwLock<HashMap>>")
+      .field("notifier", &self.notifier)
+      .finish_non_exhaustive()
   }
 }
 

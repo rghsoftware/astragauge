@@ -1,11 +1,10 @@
+use crate::types::{
+  Aggregation, Binding, BindingError, BindingResult, BindingSource, ResolvedBinding, Transform,
+};
 use astragauge_domain::SensorSample;
 use astragauge_sensor_store::{pattern::match_pattern, SensorStore};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-use crate::types::{
-  Aggregation, Binding, BindingError, BindingResult, BindingSource, ResolvedBinding, Transform,
-};
 
 /// Core engine for resolving sensor bindings.
 ///
@@ -130,10 +129,9 @@ impl BindingEngine {
       values.push(sample.and_then(|s| s.value));
     }
 
-    let aggregated = aggregation.apply(&values);
-    let source_count = matching_ids.len();
+    let result = aggregation.apply(&values);
 
-    Ok((aggregated, source_count))
+    Ok((result.value, result.valid_count))
   }
 }
 
@@ -569,5 +567,74 @@ mod tests {
 
     let result = engine.resolve(&binding).await;
     assert!(matches!(result, Err(BindingError::UnresolvedSensor(_))));
+  }
+
+  #[tokio::test]
+  async fn test_wildcard_source_count_reflects_valid_values_only() {
+    let store = SensorStore::new();
+
+    let descriptors: Vec<SensorDescriptor> = vec![
+      SensorDescriptor {
+        id: make_id("cpu.core0.temperature"),
+        name: "Core 0".to_string(),
+        unit: "C".to_string(),
+        category: "cpu".to_string(),
+        device: None,
+        tags: vec![],
+      },
+      SensorDescriptor {
+        id: make_id("cpu.core1.temperature"),
+        name: "Core 1".to_string(),
+        unit: "C".to_string(),
+        category: "cpu".to_string(),
+        device: None,
+        tags: vec![],
+      },
+      SensorDescriptor {
+        id: make_id("cpu.core2.temperature"),
+        name: "Core 2".to_string(),
+        unit: "C".to_string(),
+        category: "cpu".to_string(),
+        device: None,
+        tags: vec![],
+      },
+    ];
+
+    for desc in &descriptors {
+      store.register_sensor(desc.clone()).await.unwrap();
+    }
+
+    // Only push values for 2 of 3 sensors (core2 remains None)
+    store
+      .push_sample(SensorSample {
+        sensor_id: make_id("cpu.core0.temperature"),
+        value: Some(40.0),
+        timestamp_ms: 1000,
+      })
+      .await
+      .unwrap();
+    store
+      .push_sample(SensorSample {
+        sensor_id: make_id("cpu.core1.temperature"),
+        value: Some(50.0),
+        timestamp_ms: 1000,
+      })
+      .await
+      .unwrap();
+
+    let engine = BindingEngine::new(store);
+
+    let binding = Binding {
+      source: BindingSource::Wildcard {
+        pattern: "cpu.core*.temperature".to_string(),
+        aggregation: Aggregation::Avg,
+      },
+      transform: None,
+      target_property: "value".to_string(),
+    };
+
+    let result = engine.resolve(&binding).await.unwrap();
+    assert_eq!(result.value, Some(45.0)); // (40 + 50) / 2
+    assert_eq!(result.source_count, 2); // only valid values, not 3 matched
   }
 }
