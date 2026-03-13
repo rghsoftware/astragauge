@@ -95,6 +95,20 @@ impl FromStr for SensorId {
   }
 }
 
+impl std::ops::Deref for SensorId {
+  type Target = str;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+impl AsRef<str> for SensorId {
+  fn as_ref(&self) -> &str {
+    &self.0
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

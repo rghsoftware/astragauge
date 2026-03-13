@@ -126,7 +126,7 @@ pub struct Theming {
   pub supports_accent: bool,
   pub supports_threshold_colors: bool,
   pub supports_typography_roles: bool,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub style_slots: Vec<String>,
 }
 
@@ -148,7 +148,7 @@ pub struct Validation {
   pub min_supported_bindings: Option<u8>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub max_supported_bindings: Option<u8>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub required_props: Vec<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub layout_rules: Option<serde_json::Value>,

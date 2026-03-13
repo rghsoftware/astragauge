@@ -10,7 +10,7 @@ pub struct SensorDescriptor {
   pub unit: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub device: Option<String>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub tags: Vec<String>,
 }
 
