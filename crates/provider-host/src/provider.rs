@@ -7,8 +7,8 @@ use crate::ProviderResult;
 
 /// Core Provider trait - defines the contract for all sensor providers
 #[async_trait]
-pub trait Provider {
-  /// Returns the provider's manifest metadata
+pub trait Provider: Send + Sync {
+  /// Returns provider's manifest metadata
   fn manifest(&self) -> &ProviderManifest;
 
   /// Returns the suggested polling interval for this provider
