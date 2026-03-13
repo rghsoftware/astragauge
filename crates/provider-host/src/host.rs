@@ -22,15 +22,17 @@ pub struct ProviderHost {
   providers: HashMap<String, ProviderEntry>,
   store: Arc<SensorStore>,
   shutdown_token: CancellationToken,
+  config: HostConfig,
 }
 
 impl ProviderHost {
-  pub fn new(_config: HostConfig, store: Arc<SensorStore>) -> Self {
+  pub fn new(config: HostConfig, store: Arc<SensorStore>) -> Self {
     let shutdown_token = CancellationToken::new();
     Self {
       providers: HashMap::new(),
       store,
       shutdown_token,
+      config,
     }
   }
 
@@ -82,6 +84,63 @@ impl ProviderHost {
     }
 
     count
+  }
+
+  pub async fn shutdown(&mut self) -> ProviderResult<()> {
+    let provider_count = self.providers.len();
+    tracing::info!("Initiating shutdown of {} providers", provider_count);
+
+    self.shutdown_token.cancel();
+
+    let timeout_duration = tokio::time::Duration::from_millis(self.config.shutdown_timeout_ms);
+    let mut finished = 0;
+    let mut timed_out = 0;
+
+    let tasks: Vec<(String, JoinHandle<()>)> = self
+      .providers
+      .iter_mut()
+      .filter_map(|(id, entry)| entry.task.take().map(|task| (id.clone(), task)))
+      .collect();
+
+    for (id, task) in tasks {
+      tracing::debug!("Waiting for provider {} task to complete...", id);
+
+      match tokio::time::timeout(timeout_duration, task).await {
+        Ok(Ok(())) => {
+          tracing::debug!("Provider {} task completed", id);
+          finished += 1;
+        }
+        Ok(Err(join_error)) => {
+          tracing::warn!(
+            "Provider {} task panicked during shutdown: {}",
+            id,
+            join_error
+          );
+          finished += 1;
+        }
+        Err(_) => {
+          tracing::warn!("Provider {} did not complete within timeout", id);
+          timed_out += 1;
+        }
+      }
+    }
+
+    tracing::info!(
+      "Shutdown completed: {} providers finished, {} timed out",
+      finished,
+      timed_out
+    );
+
+    if timed_out > 0 {
+      Err(ProviderError::ShutdownFailed {
+        message: format!(
+          "{} provider(s) did not complete within {}ms timeout",
+          timed_out, self.config.shutdown_timeout_ms
+        ),
+      })
+    } else {
+      Ok(())
+    }
   }
 
   fn spawn_poll_task(
@@ -514,5 +573,45 @@ mod tests {
 
     assert!(matches!(healthy_status, ProviderHealth::Ok));
     assert!(matches!(panicking_status, ProviderHealth::Error { .. }));
+  }
+
+  #[tokio::test]
+  async fn shutdown_cancels_all_provider_tasks() {
+    let store = Arc::new(SensorStore::new());
+    let config = HostConfig::default();
+    let mut host = ProviderHost::new(config, store);
+
+    let provider: Arc<Box<dyn Provider>> = Arc::new(Box::new(
+      HealthyProvider::new("test-provider", "test.sensor").unwrap(),
+    ));
+    host.register_provider(provider).unwrap();
+
+    host.start();
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let result = host.shutdown().await;
+    assert!(result.is_ok());
+  }
+
+  #[tokio::test]
+  async fn shutdown_waits_for_in_flight_poll() {
+    let store = Arc::new(SensorStore::new());
+    let config = HostConfig::default();
+    let mut host = ProviderHost::new(config, store);
+
+    let provider: Arc<Box<dyn Provider>> = Arc::new(Box::new(
+      HealthyProvider::new("slow-provider", "test.slow").unwrap(),
+    ));
+    host.register_provider(provider).unwrap();
+
+    host.start();
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let result = host.shutdown().await;
+    assert!(result.is_ok());
+
+    assert!(host.providers.get("slow-provider").unwrap().task.is_none());
   }
 }
