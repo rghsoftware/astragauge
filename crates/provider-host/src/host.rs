@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, RwLock};
 
 use astragauge_sensor_store::{SensorStore, StoreError};
+use futures::FutureExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -13,8 +15,7 @@ use crate::provider::Provider;
 pub struct ProviderEntry {
   provider: Arc<Box<dyn Provider>>,
   task: Option<JoinHandle<()>>,
-  #[allow(dead_code)]
-  health: ProviderHealth,
+  health: Arc<RwLock<ProviderHealth>>,
 }
 
 pub struct ProviderHost {
@@ -49,7 +50,7 @@ impl ProviderHost {
       ProviderEntry {
         provider: Arc::clone(&provider),
         task: None,
-        health: ProviderHealth::Ok,
+        health: Arc::new(RwLock::new(ProviderHealth::Ok)),
       },
     );
 
@@ -64,7 +65,11 @@ impl ProviderHost {
       .iter()
       .filter(|(_, entry)| entry.task.is_none())
       .map(|(id, entry)| {
-        let task = self.spawn_poll_task(id.clone(), Arc::clone(&entry.provider));
+        let task = self.spawn_poll_task(
+          id.clone(),
+          Arc::clone(&entry.provider),
+          Arc::clone(&entry.health),
+        );
         (id.clone(), task)
       })
       .collect();
@@ -79,14 +84,33 @@ impl ProviderHost {
     count
   }
 
-  fn spawn_poll_task(&self, id: String, provider: Arc<Box<dyn Provider>>) -> JoinHandle<()> {
+  fn spawn_poll_task(
+    &self,
+    id: String,
+    provider: Arc<Box<dyn Provider>>,
+    health: Arc<RwLock<ProviderHealth>>,
+  ) -> JoinHandle<()> {
     let store = Arc::clone(&self.store);
     let token = self.shutdown_token.clone();
     let poll_interval = provider.as_ref().poll_interval();
 
     tokio::spawn(async move {
-      if let Err(e) = Self::discover_and_register(&provider, &store, &id).await {
-        tracing::error!("Provider {} sensor discovery failed: {:?}", id, e);
+      let discover_result = AssertUnwindSafe(provider.as_ref().discover())
+        .catch_unwind()
+        .await;
+
+      match discover_result {
+        Ok(Ok(descriptors)) => {
+          if let Err(e) = Self::register_sensors(&store, &id, descriptors).await {
+            tracing::error!("Provider {} sensor registration failed: {:?}", id, e);
+          }
+        }
+        Ok(Err(e)) => {
+          tracing::error!("Provider {} sensor discovery failed: {:?}", id, e);
+        }
+        Err(panic_payload) => {
+          Self::handle_panic(&id, &health, panic_payload);
+        }
       }
 
       let mut tick = tokio::time::interval(poll_interval);
@@ -94,14 +118,21 @@ impl ProviderHost {
       loop {
         tokio::select! {
           _ = tick.tick() => {
-            match provider.as_ref().poll().await {
-              Ok(samples) => {
+            let poll_result = AssertUnwindSafe(provider.as_ref().poll())
+              .catch_unwind()
+              .await;
+
+            match poll_result {
+              Ok(Ok(samples)) => {
                 Self::push_samples_with_defensive_registration(
-                  &provider, &store, &id, samples
+                  &provider, &store, &id, &health, samples
                 ).await;
               }
-              Err(e) => {
+              Ok(Err(e)) => {
                 tracing::error!("Provider {} polling failed: {:?}", id, e);
+              }
+              Err(panic_payload) => {
+                Self::handle_panic(&id, &health, panic_payload);
               }
             }
           }
@@ -114,12 +145,31 @@ impl ProviderHost {
     })
   }
 
-  async fn discover_and_register(
-    provider: &Arc<Box<dyn Provider>>,
+  fn handle_panic(
+    provider_id: &str,
+    health: &Arc<RwLock<ProviderHealth>>,
+    payload: Box<dyn std::any::Any + Send>,
+  ) {
+    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+      s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+      s.clone()
+    } else {
+      "Unknown panic".to_string()
+    };
+
+    tracing::error!("Provider {} panicked: {}", provider_id, message);
+
+    if let Ok(mut health_guard) = health.write() {
+      *health_guard = ProviderHealth::Error { message };
+    }
+  }
+
+  async fn register_sensors(
     store: &Arc<SensorStore>,
     provider_id: &str,
+    descriptors: Vec<astragauge_domain::SensorDescriptor>,
   ) -> ProviderResult<()> {
-    let descriptors = provider.as_ref().discover().await?;
     let count = descriptors.len();
     tracing::info!("Provider {} discovered {} sensors", provider_id, count);
 
@@ -142,6 +192,7 @@ impl ProviderHost {
     provider: &Arc<Box<dyn Provider>>,
     store: &Arc<SensorStore>,
     provider_id: &str,
+    health: &Arc<RwLock<ProviderHealth>>,
     samples: Vec<astragauge_domain::SensorSample>,
   ) {
     let sample_count = samples.len();
@@ -155,6 +206,7 @@ impl ProviderHost {
             &unknown_id,
             &samples,
             provider_id,
+            health,
             sample_count,
           )
           .await;
@@ -178,6 +230,7 @@ impl ProviderHost {
     unknown_id: &astragauge_domain::SensorId,
     samples: &[astragauge_domain::SensorSample],
     provider_id: &str,
+    health: &Arc<RwLock<ProviderHealth>>,
     sample_count: usize,
   ) {
     tracing::warn!(
@@ -185,8 +238,12 @@ impl ProviderHost {
       unknown_id.as_str()
     );
 
-    match provider.as_ref().discover().await {
-      Ok(descriptors) => {
+    let discover_result = AssertUnwindSafe(provider.as_ref().discover())
+      .catch_unwind()
+      .await;
+
+    match discover_result {
+      Ok(Ok(descriptors)) => {
         if let Some(descriptor) = descriptors.iter().find(|d| &d.id == unknown_id) {
           match store.register_sensor(descriptor.clone()).await {
             Ok(()) => {
@@ -214,12 +271,248 @@ impl ProviderHost {
           }
         }
       }
-      Err(e) => {
+      Ok(Err(e)) => {
         tracing::error!(
           "Failed to re-discover sensors for defensive registration: {:?}",
           e
         );
       }
+      Err(panic_payload) => {
+        Self::handle_panic(provider_id, health, panic_payload);
+      }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::provider::Provider;
+  use astragauge_domain::{
+    DomainError, ProviderCapabilities, ProviderManifest, SensorCategories, SensorDescriptor,
+    SensorId, SensorSample,
+  };
+  use async_trait::async_trait;
+  use std::time::Duration;
+
+  fn make_manifest(id: &str) -> ProviderManifest {
+    ProviderManifest {
+      id: id.to_string(),
+      name: format!("{} provider", id),
+      version: "1.0.0".to_string(),
+      description: "Test provider".to_string(),
+      author: None,
+      website: None,
+      repository: None,
+      license: None,
+      tags: None,
+      runtime: ">=1.0.0".to_string(),
+      capabilities: ProviderCapabilities {
+        historical: false,
+        high_frequency: false,
+        hardware_access: false,
+      },
+      sensors: SensorCategories { categories: vec![] },
+    }
+  }
+
+  struct PanickingProvider {
+    manifest: ProviderManifest,
+  }
+
+  impl PanickingProvider {
+    fn new(id: &str) -> Self {
+      Self {
+        manifest: make_manifest(id),
+      }
+    }
+  }
+
+  #[async_trait]
+  impl Provider for PanickingProvider {
+    fn manifest(&self) -> &ProviderManifest {
+      &self.manifest
+    }
+
+    fn poll_interval(&self) -> Duration {
+      Duration::from_millis(10)
+    }
+
+    async fn discover(&self) -> ProviderResult<Vec<SensorDescriptor>> {
+      panic!("discover() panicked!")
+    }
+
+    async fn poll(&self) -> ProviderResult<Vec<SensorSample>> {
+      Ok(vec![])
+    }
+
+    async fn health(&self) -> ProviderHealth {
+      ProviderHealth::Ok
+    }
+
+    async fn shutdown(&self) -> ProviderResult<()> {
+      Ok(())
+    }
+  }
+
+  struct PollPanickingProvider {
+    manifest: ProviderManifest,
+  }
+
+  impl PollPanickingProvider {
+    fn new(id: &str) -> Self {
+      Self {
+        manifest: make_manifest(id),
+      }
+    }
+  }
+
+  #[async_trait]
+  impl Provider for PollPanickingProvider {
+    fn manifest(&self) -> &ProviderManifest {
+      &self.manifest
+    }
+
+    fn poll_interval(&self) -> Duration {
+      Duration::from_millis(10)
+    }
+
+    async fn discover(&self) -> ProviderResult<Vec<SensorDescriptor>> {
+      Ok(vec![])
+    }
+
+    async fn poll(&self) -> ProviderResult<Vec<SensorSample>> {
+      panic!("poll() panicked!")
+    }
+
+    async fn health(&self) -> ProviderHealth {
+      ProviderHealth::Ok
+    }
+
+    async fn shutdown(&self) -> ProviderResult<()> {
+      Ok(())
+    }
+  }
+
+  struct HealthyProvider {
+    manifest: ProviderManifest,
+    sensor_id: SensorId,
+  }
+
+  impl HealthyProvider {
+    fn new(id: &str, sensor_id: &str) -> Result<Self, DomainError> {
+      Ok(Self {
+        manifest: make_manifest(id),
+        sensor_id: SensorId::new(sensor_id.to_string())?,
+      })
+    }
+  }
+
+  #[async_trait]
+  impl Provider for HealthyProvider {
+    fn manifest(&self) -> &ProviderManifest {
+      &self.manifest
+    }
+
+    fn poll_interval(&self) -> Duration {
+      Duration::from_millis(10)
+    }
+
+    async fn discover(&self) -> ProviderResult<Vec<SensorDescriptor>> {
+      Ok(vec![SensorDescriptor {
+        id: self.sensor_id.clone(),
+        name: "Test sensor".to_string(),
+        category: "test".to_string(),
+        unit: "none".to_string(),
+        device: None,
+        tags: vec![],
+      }])
+    }
+
+    async fn poll(&self) -> ProviderResult<Vec<SensorSample>> {
+      Ok(vec![SensorSample {
+        sensor_id: self.sensor_id.clone(),
+        timestamp_ms: 0,
+        value: Some(42.0),
+      }])
+    }
+
+    async fn health(&self) -> ProviderHealth {
+      ProviderHealth::Ok
+    }
+
+    async fn shutdown(&self) -> ProviderResult<()> {
+      Ok(())
+    }
+  }
+
+  #[tokio::test]
+  #[ignore = "requires panic containment test infrastructure"]
+  async fn panic_containment_discover_updates_health() {
+    let store = Arc::new(SensorStore::new());
+    let config = HostConfig::default();
+    let mut host = ProviderHost::new(config, store);
+
+    let provider: Arc<Box<dyn Provider>> = Arc::new(Box::new(PanickingProvider::new("panic-test")));
+    host.register_provider(provider).unwrap();
+
+    let health_arc = Arc::clone(&host.providers.get("panic-test").unwrap().health);
+
+    host.start();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let health = health_arc.read().unwrap().clone();
+    assert!(matches!(health, ProviderHealth::Error { .. }));
+  }
+
+  #[tokio::test]
+  #[ignore = "requires panic containment test infrastructure"]
+  async fn panic_containment_poll_updates_health() {
+    let store = Arc::new(SensorStore::new());
+    let config = HostConfig::default();
+    let mut host = ProviderHost::new(config, store);
+
+    let provider: Arc<Box<dyn Provider>> =
+      Arc::new(Box::new(PollPanickingProvider::new("poll-panic-test")));
+    host.register_provider(provider).unwrap();
+
+    let health_arc = Arc::clone(&host.providers.get("poll-panic-test").unwrap().health);
+
+    host.start();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let health = health_arc.read().unwrap().clone();
+    assert!(matches!(health, ProviderHealth::Error { ref message } if message.contains("poll()")));
+  }
+
+  #[tokio::test]
+  #[ignore = "requires panic containment test infrastructure"]
+  async fn panic_containment_other_providers_continue() {
+    let store = Arc::new(SensorStore::new());
+    let config = HostConfig::default();
+    let mut host = ProviderHost::new(config, Arc::clone(&store));
+
+    let healthy: Arc<Box<dyn Provider>> = Arc::new(Box::new(
+      HealthyProvider::new("healthy", "test.healthy").unwrap(),
+    ));
+    let panicking: Arc<Box<dyn Provider>> = Arc::new(Box::new(PanickingProvider::new("panicking")));
+
+    host.register_provider(healthy).unwrap();
+    host.register_provider(panicking).unwrap();
+
+    let healthy_health = Arc::clone(&host.providers.get("healthy").unwrap().health);
+    let panicking_health = Arc::clone(&host.providers.get("panicking").unwrap().health);
+
+    host.start();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let healthy_status = healthy_health.read().unwrap().clone();
+    let panicking_status = panicking_health.read().unwrap().clone();
+
+    assert!(matches!(healthy_status, ProviderHealth::Ok));
+    assert!(matches!(panicking_status, ProviderHealth::Error { .. }));
   }
 }
