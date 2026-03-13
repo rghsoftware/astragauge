@@ -18,7 +18,7 @@ pub struct WidgetPlacement {
   pub y: u8,
   pub w: u8,
   pub h: u8,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   pub bindings: HashMap<String, String>,
 }
 
@@ -29,7 +29,7 @@ pub struct PanelDocument {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub theme: Option<String>,
   pub grid: GridConfig,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub widgets: Vec<WidgetPlacement>,
 }
 
@@ -162,7 +162,7 @@ mod tests {
     };
 
     let json = serde_json::to_string(&widget).unwrap();
-    assert!(json.contains("bindings"));
+    assert!(!json.contains("bindings"));
   }
 
   #[test]

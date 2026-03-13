@@ -164,9 +164,9 @@ pub struct WidgetManifest {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub description: Option<String>,
   pub sizing: Sizing,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub properties: Vec<Property>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub bindings: Vec<BindingTarget>,
   pub preview: Preview,
   pub theming: Theming,
