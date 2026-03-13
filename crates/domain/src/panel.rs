@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct GridConfig {
   pub columns: u8,
   pub row_height: u16,
@@ -43,7 +43,7 @@ mod tests {
             "version": 1,
             "name": "Mission Control",
             "theme": "default-dark",
-            "grid": { "columns": 12, "row_height": 80, "spacing": 8 },
+            "grid": { "columns": 12, "rowHeight": 80, "spacing": 8 },
             "widgets": [
                 { "id": "cpu_load", "type": "stat", "x": 0, "y": 0, "w": 3, "h": 2, "bindings": { "value": "cpu.total.utilization" } }
             ]
@@ -101,7 +101,7 @@ mod tests {
 
   #[test]
   fn test_grid_config_json() {
-    let json = r#"{ "columns": 12, "row_height": 80, "spacing": 8 }"#;
+    let json = r#"{ "columns": 12, "rowHeight": 80, "spacing": 8 }"#;
     let grid: GridConfig = serde_json::from_str(json).unwrap();
 
     assert_eq!(grid.columns, 12);
@@ -140,7 +140,7 @@ mod tests {
     let json = r#"{
             "version": 1,
             "name": "No Theme Panel",
-            "grid": { "columns": 8, "row_height": 60, "spacing": 4 },
+            "grid": { "columns": 8, "rowHeight": 60, "spacing": 4 },
             "widgets": []
         }"#;
 

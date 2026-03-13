@@ -19,7 +19,9 @@ pub struct SensorDescriptor {
 pub struct SensorSample {
   pub sensor_id: SensorId,
   pub timestamp_ms: u64,
-  pub value: f64,
+  /// Sensor value, or None if the sensor is missing/unavailable.
+  /// Per sensor-store.md spec: "missing sensor" should return null/undefined.
+  pub value: Option<f64>,
 }
 
 #[cfg(test)]
@@ -62,7 +64,7 @@ mod tests {
         }"#;
     let sample: SensorSample = serde_json::from_str(json).unwrap();
     assert_eq!(sample.timestamp_ms, 1712345678);
-    assert!((sample.value - 72.3).abs() < f64::EPSILON);
+    assert!((sample.value.unwrap() - 72.3).abs() < f64::EPSILON);
   }
 
   #[test]
@@ -86,7 +88,7 @@ mod tests {
     let original = SensorSample {
       sensor_id: SensorId::new("cpu.core0.frequency").unwrap(),
       timestamp_ms: 1712345678901,
-      value: 3500.5,
+      value: Some(3500.5),
     };
 
     let json = serde_json::to_string(&original).unwrap();
@@ -95,14 +97,27 @@ mod tests {
   }
 
   #[test]
-  fn test_sensor_sample_nan_value() {
+  fn test_sensor_sample_null_value() {
     let json = r#"{
             "sensor_id": "cpu.temperature",
             "timestamp_ms": 1712345678,
             "value": null
         }"#;
-    let result: Result<SensorSample, _> = serde_json::from_str(json);
-    assert!(result.is_err() || result.unwrap().value.is_nan());
+    let sample: SensorSample = serde_json::from_str(json).unwrap();
+    assert_eq!(sample.value, None);
+  }
+
+  #[test]
+  fn test_sensor_sample_null_roundtrip() {
+    let original = SensorSample {
+      sensor_id: SensorId::new("cpu.temperature").unwrap(),
+      timestamp_ms: 1712345678,
+      value: None,
+    };
+
+    let json = serde_json::to_string(&original).unwrap();
+    let parsed: SensorSample = serde_json::from_str(&json).unwrap();
+    assert_eq!(original, parsed);
   }
 
   #[test]

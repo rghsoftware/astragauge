@@ -34,14 +34,20 @@ pub enum PropertyType {
 
 /// Type of value expected for a binding target.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum BindingValueType {
+  #[serde(rename = "number")]
   Number,
+  #[serde(rename = "string")]
   String,
+  #[serde(rename = "boolean")]
   Boolean,
-  Series,
+  #[serde(rename = "series<number>")]
+  SeriesNumber,
+  #[serde(rename = "color_role")]
   ColorRole,
+  #[serde(rename = "state")]
   State,
+  #[serde(rename = "timestamp")]
   Timestamp,
 }
 
@@ -205,7 +211,7 @@ mod tests {
         "description": "Displays a compact historical trend line.",
         "sizing": { "default_w": 4, "default_h": 2, "min_w": 3, "min_h": 1, "resize_mode": "responsive" },
         "properties": [{ "key": "show_fill", "label": "Show Fill", "type": "boolean", "required": false, "default": false }],
-        "bindings": [{ "key": "series", "label": "Series", "value_type": "series", "required": true, "multi": false }],
+        "bindings": [{ "key": "series", "label": "Series", "value_type": "series<number>", "required": true, "multi": false }],
         "preview": { "mock_kind": "timeseries", "sample_bindings": { "series": [12, 18, 23, 19, 25, 28, 21] } },
         "theming": { "supports_background": true, "supports_accent": true, "supports_threshold_colors": false, "supports_typography_roles": false, "style_slots": ["surface", "trend_line", "trend_fill"] },
         "capabilities": { "supports_history": true, "supports_thresholds": false, "supports_multiple_series": false, "supports_secondary_text": false, "supports_overlay": false },
@@ -281,7 +287,10 @@ mod tests {
 
     assert_eq!(manifest.bindings.len(), 1);
     assert_eq!(manifest.bindings[0].key, "series");
-    assert_eq!(manifest.bindings[0].value_type, BindingValueType::Series);
+    assert_eq!(
+      manifest.bindings[0].value_type,
+      BindingValueType::SeriesNumber
+    );
 
     assert_eq!(manifest.preview.mock_kind, MockKind::Timeseries);
     assert!(manifest.preview.sample_props.is_none());
@@ -358,8 +367,8 @@ mod tests {
       BindingValueType::Number
     );
     assert_eq!(
-      serde_json::from_str::<BindingValueType>(r#""series""#).unwrap(),
-      BindingValueType::Series
+      serde_json::from_str::<BindingValueType>(r#""series<number>""#).unwrap(),
+      BindingValueType::SeriesNumber
     );
   }
 
