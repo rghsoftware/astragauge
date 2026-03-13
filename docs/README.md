@@ -52,7 +52,7 @@ docs/
 
 High-level system structure and major runtime/editor relationships.
 
-### `architecture/overview.md`
+### [`overview.md`](architecture/overview.md)
 High-level map of the AstraGauge platform.
 
 Use this when you want to understand:
@@ -61,7 +61,7 @@ Use this when you want to understand:
 - the core runtime data flow
 - how the specs fit together
 
-### `architecture/runtime.md`
+### [`runtime.md`](architecture/runtime.md)
 Defines the internal runtime architecture.
 
 Use this when working on:
@@ -72,7 +72,7 @@ Use this when working on:
 - threading and batching
 - panel session orchestration
 
-### `architecture/panel-editor.md`
+### [`panel-editor.md`](architecture/panel-editor.md)
 Defines the architecture of the visual panel editor.
 
 Use this when working on:
@@ -220,12 +220,12 @@ Use this when working on:
 
 Read in this order:
 
-1. `architecture/overview.md`
-2. `project/branding.md`
-3. `project/design-system.md`
-4. `architecture/runtime.md`
-5. `specs/sensor-schema.md`
-6. `specs/panel-format.md`
+1. [`architecture/overview.md`](architecture/overview.md)
+2. [`project/branding.md`](project/branding.md)
+3. [`project/design-system.md`](project/design-system.md)
+4. [`architecture/runtime.md`](architecture/runtime.md)
+5. [`specs/sensor-schema.md`](specs/sensor-schema.md)
+6. [`specs/panel-format.md`](specs/panel-format.md)
 
 This gives a clean overview before diving into subsystem details.
 
@@ -235,11 +235,11 @@ This gives a clean overview before diving into subsystem details.
 
 Read in this order:
 
-1. `architecture/runtime.md`
-2. `specs/sensor-store.md`
-3. `specs/binding-engine.md`
-4. `specs/provider-packaging.md`
-5. `specs/sensor-schema.md`
+1. [`architecture/runtime.md`](architecture/runtime.md)
+2. [`specs/sensor-store.md`](specs/sensor-store.md)
+3. [`specs/binding-engine.md`](specs/binding-engine.md)
+4. [`specs/provider-packaging.md`](specs/provider-packaging.md)
+5. [`specs/sensor-schema.md`](specs/sensor-schema.md)
 
 ---
 
