@@ -1,0 +1,29 @@
+# ESLint ignore file
+
+# Build outputs
+build/
+dist/
+.svelte-kit/
+
+# Dependencies
+node_modules/
+
+# Generated files
+*.generated.*
+
+# Static assets
+static/
+
+# Documentation
+AGENTS.md
+**/AGENTS.md
+CLAUDE.md
+**/CLAUDE.md
+docs/
+
+# Config files
+*.config.js
+*.config.ts
+svelte.config.js
+vite.config.js
+tsconfig.json

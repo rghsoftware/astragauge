@@ -1,0 +1,45 @@
+# EditorConfig - Cross-editor formatting settings
+# https://editorconfig.org
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+# Rust
+[*.rs]
+indent_size = 2
+max_line_length = 100
+
+# TypeScript/JavaScript
+[*.{ts,tsx,js,jsx,mjs,cjs}]
+indent_size = 2
+
+# Svelte
+[*.svelte]
+indent_size = 2
+
+# JSON
+[*.json]
+indent_size = 2
+
+# TOML
+[*.toml]
+indent_size = 2
+
+# YAML
+[*.{yml,yaml}]
+indent_size = 2
+
+# Markdown (preserve trailing whitespace for line breaks)
+[*.md]
+trim_trailing_whitespace = false
+indent_size = 2
+
+# Makefiles (require tabs)
+[Makefile]
+indent_style = tab

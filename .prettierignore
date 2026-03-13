@@ -1,0 +1,37 @@
+# Prettier ignore file
+
+# Build outputs
+build/
+dist/
+.svelte-kit/
+
+# Dependencies
+node_modules/
+
+# Rust
+target/
+**/*.rs
+
+# Generated files
+*.generated.*
+
+# Documentation (preserve formatting)
+AGENTS.md
+**/AGENTS.md
+CLAUDE.md
+**/CLAUDE.md
+
+# Lock files
+bun.lock
+package-lock.json
+yarn.lock
+Cargo.lock
+
+# Static assets
+static/
+*.min.js
+*.min.css
+
+# Config files that should not be reformatted
+*.conf.json
+tauri.conf.json

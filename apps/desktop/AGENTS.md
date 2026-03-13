@@ -6,11 +6,13 @@
 ---
 
 ## OVERVIEW
+
 Tauri v2 + SvelteKit 5 desktop application shell and frontend implementation.
 
 ---
 
 ## STRUCTURE
+
 ```
 apps/desktop/
 ├── src/                # SvelteKit frontend
@@ -29,31 +31,34 @@ apps/desktop/
 
 ## WHERE TO LOOK
 
-| Task | Location |
-|------|----------|
-| **Frontend Entry** | `src/routes/+page.svelte` |
-| **Global Layout** | `src/routes/+layout.svelte` |
-| **SSR Configuration** | `src/routes/+layout.ts` |
-| **Rust Commands** | `src-tauri/src/lib.rs` |
-| **App Permissions** | `src-tauri/capabilities/` |
-| **Build Output** | `build/` (generated) |
-| **Tauri Config** | `src-tauri/tauri.conf.json` |
+| Task                  | Location                    |
+| --------------------- | --------------------------- |
+| **Frontend Entry**    | `src/routes/+page.svelte`   |
+| **Global Layout**     | `src/routes/+layout.svelte` |
+| **SSR Configuration** | `src/routes/+layout.ts`     |
+| **Rust Commands**     | `src-tauri/src/lib.rs`      |
+| **App Permissions**   | `src-tauri/capabilities/`   |
+| **Build Output**      | `build/` (generated)        |
+| **Tauri Config**      | `src-tauri/tauri.conf.json` |
 
 ---
 
 ## CONVENTIONS
 
 ### SvelteKit Integration
+
 - **SPA Mode Only**: `export const ssr = false` in `+layout.ts` is mandatory.
 - **Static Adapter**: Uses `@sveltejs/adapter-static` with `fallback: "index.html"`.
 - **Routing**: Standard SvelteKit file-based routing.
 
 ### Tauri IPC
+
 - **Invoke**: Use `import { invoke } from "@tauri-apps/api/core"` for Rust calls.
 - **Commands**: Define in `lib.rs` with `#[tauri::command]`, register in `generate_handler!`.
 - **Events**: Use `@tauri-apps/api/event` for fire-and-forget notifications.
 
 ### Frontend Patterns
+
 - **Reactivity**: Use Svelte 5 runes (`$state`, `$derived`, `$effect`).
 - **Styling**: Scoped `<style>` blocks or global CSS in `src/app.css`.
 - **Strict Port**: Vite must use port 1420 (`strictPort: true`) for Tauri IPC.

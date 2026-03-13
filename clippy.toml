@@ -1,0 +1,5 @@
+# Clippy linting configuration
+# Run with: cargo clippy
+
+# Allow certain patterns common in Tauri apps
+avoid-breaking-exported-api = true
