@@ -19,27 +19,3 @@ entry = "cargo clippy --all-targets -- -D warnings"
 language = "system"
 files = "\\.rs$"
 pass_filenames = false
-
-[[repos.hooks]]
-id = "eslint"
-name = "eslint"
-entry = "bun run lint"
-language = "system"
-files = "\\.(ts|tsx|svelte)$"
-pass_filenames = false
-
-[[repos.hooks]]
-id = "prettier"
-name = "prettier"
-entry = "bun run format --check"
-language = "system"
-files = "\\.(ts|tsx|svelte|css|json|md)$"
-pass_filenames = false
-
-[[repos.hooks]]
-id = "svelte-check"
-name = "svelte-check"
-entry = "bun run check"
-language = "system"
-files = "\\.(ts|svelte)$"
-pass_filenames = false
