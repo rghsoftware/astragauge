@@ -1,0 +1,12 @@
+[package]
+name = "astragauge-provider-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+astragauge-domain = { path = "../domain" }
+astragauge-sensor-store = { path = "../sensor-store" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
