@@ -28,7 +28,7 @@ pub struct SensorInfo {
   pub name: String,
   pub category: String,
   pub unit: String,
-  pub provider_id: String,
+  pub device_id: String,
 }
 
 #[tauri::command]
@@ -40,7 +40,7 @@ async fn list_available_sensors(
   let mut sensors = Vec::new();
   for sensor_id in sensor_ids {
     if let Some(descriptor) = store.get_descriptor(&sensor_id).await {
-      let provider_id = sensor_id
+      let device_id = sensor_id
         .split('.')
         .next()
         .unwrap_or(&sensor_id)
@@ -51,7 +51,7 @@ async fn list_available_sensors(
         name: descriptor.name,
         category: descriptor.category,
         unit: descriptor.unit,
-        provider_id,
+        device_id,
       });
     }
   }
@@ -86,7 +86,14 @@ pub fn run() {
     ])
     .setup(move |_app| {
       tauri::async_runtime::spawn(async move {
-        host_clone.write().unwrap().start();
+        match host_clone.write() {
+          Ok(mut host) => {
+            host.start();
+          }
+          Err(e) => {
+            tracing::error!("Provider host lock poisoned: {}", e);
+          }
+        }
       });
       Ok(())
     })
@@ -150,7 +157,7 @@ mod tests {
       name: "CPU Temperature".to_string(),
       category: "temperature".to_string(),
       unit: "celsius".to_string(),
-      provider_id: "cpu".to_string(),
+      device_id: "cpu".to_string(),
     };
 
     let json = serde_json::to_string(&sensor).expect("Should serialize to JSON");
@@ -158,7 +165,7 @@ mod tests {
     assert!(json.contains("\"name\":\"CPU Temperature\""));
     assert!(json.contains("\"category\":\"temperature\""));
     assert!(json.contains("\"unit\":\"celsius\""));
-    assert!(json.contains("\"provider_id\":\"cpu\""));
+    assert!(json.contains("\"device_id\":\"cpu\""));
   }
 
   #[test]

@@ -1,38 +1,19 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Error)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderError {
+  #[error("Provider discovery failed: {message}")]
   DiscoveryFailed { message: String },
+  #[error("Provider poll failed: {message}")]
   PollFailed { message: String },
+  #[error("Provider shutdown failed: {message}")]
   ShutdownFailed { message: String },
+  #[error("Provider registration failed for '{id}': {reason}")]
   RegistrationFailed { id: String, reason: String },
+  #[error("Invalid manifest: {reason}")]
   InvalidManifest { reason: String },
 }
-
-impl fmt::Display for ProviderError {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match self {
-      ProviderError::DiscoveryFailed { message } => {
-        write!(f, "Provider discovery failed: {}", message)
-      }
-      ProviderError::PollFailed { message } => {
-        write!(f, "Provider poll failed: {}", message)
-      }
-      ProviderError::ShutdownFailed { message } => {
-        write!(f, "Provider shutdown failed: {}", message)
-      }
-      ProviderError::RegistrationFailed { id, reason } => {
-        write!(f, "Provider registration failed for '{}': {}", id, reason)
-      }
-      ProviderError::InvalidManifest { reason } => {
-        write!(f, "Invalid manifest: {}", reason)
-      }
-    }
-  }
-}
-
-impl std::error::Error for ProviderError {}
 
 pub type ProviderResult<T> = Result<T, ProviderError>;
