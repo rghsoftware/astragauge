@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use astragauge_sensor_store::{SensorStore, StoreError};
 use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -341,6 +342,30 @@ impl ProviderHost {
       }
     }
   }
+
+  pub fn get_providers_status(&self) -> Vec<ProviderStatus> {
+    self
+      .providers
+      .iter()
+      .map(|(id, entry)| {
+        let health = entry.health.read().unwrap().clone();
+        ProviderStatus {
+          id: id.clone(),
+          name: entry.provider.manifest().name.clone(),
+          health,
+          sensor_count: 0,
+        }
+      })
+      .collect()
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderStatus {
+  pub id: String,
+  pub name: String,
+  pub health: ProviderHealth,
+  pub sensor_count: usize,
 }
 
 #[cfg(test)]
