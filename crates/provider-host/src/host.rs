@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, RwLock};
 
@@ -17,6 +17,7 @@ pub struct ProviderEntry {
   provider: Arc<Box<dyn Provider>>,
   task: Option<JoinHandle<()>>,
   health: Arc<RwLock<ProviderHealth>>,
+  sensor_ids: Arc<RwLock<HashSet<String>>>,
 }
 
 pub struct ProviderHost {
@@ -54,6 +55,7 @@ impl ProviderHost {
         provider: Arc::clone(&provider),
         task: None,
         health: Arc::new(RwLock::new(ProviderHealth::Ok)),
+        sensor_ids: Arc::new(RwLock::new(HashSet::new())),
       },
     );
 
@@ -72,6 +74,7 @@ impl ProviderHost {
           id.clone(),
           Arc::clone(&entry.provider),
           Arc::clone(&entry.health),
+          Arc::clone(&entry.sensor_ids),
         );
         (id.clone(), task)
       })
@@ -149,6 +152,7 @@ impl ProviderHost {
     id: String,
     provider: Arc<Box<dyn Provider>>,
     health: Arc<RwLock<ProviderHealth>>,
+    sensor_ids: Arc<RwLock<HashSet<String>>>,
   ) -> JoinHandle<()> {
     let store = Arc::clone(&self.store);
     let token = self.shutdown_token.clone();
@@ -161,7 +165,7 @@ impl ProviderHost {
 
       match discover_result {
         Ok(Ok(descriptors)) => {
-          if let Err(e) = Self::register_sensors(&store, &id, descriptors).await {
+          if let Err(e) = Self::register_sensors(&store, &id, descriptors, &sensor_ids).await {
             tracing::error!("Provider {} sensor registration failed: {:?}", id, e);
           }
         }
@@ -229,20 +233,27 @@ impl ProviderHost {
     store: &Arc<SensorStore>,
     provider_id: &str,
     descriptors: Vec<astragauge_domain::SensorDescriptor>,
+    sensor_ids: &Arc<RwLock<HashSet<String>>>,
   ) -> ProviderResult<()> {
     let count = descriptors.len();
     tracing::info!("Provider {} discovered {} sensors", provider_id, count);
 
+    let mut registered_ids = Vec::new();
     for descriptor in descriptors {
       let sensor_id = descriptor.id.clone();
       match store.register_sensor(descriptor).await {
         Ok(()) => {
           tracing::debug!("Registered sensor {}", sensor_id.as_str());
+          registered_ids.push(sensor_id.as_str().to_string());
         }
         Err(e) => {
           tracing::warn!("Failed to register sensor {}: {:?}", sensor_id.as_str(), e);
         }
       }
+    }
+
+    if let Ok(mut ids) = sensor_ids.write() {
+      ids.extend(registered_ids);
     }
 
     Ok(())
@@ -349,11 +360,12 @@ impl ProviderHost {
       .iter()
       .map(|(id, entry)| {
         let health = entry.health.read().unwrap().clone();
+        let sensor_count = entry.sensor_ids.read().map(|ids| ids.len()).unwrap_or(0);
         ProviderStatus {
           id: id.clone(),
           name: entry.provider.manifest().name.clone(),
           health,
-          sensor_count: 0,
+          sensor_count,
         }
       })
       .collect()

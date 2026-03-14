@@ -1,8 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
 
-use astragauge_provider_host::Provider;
 use astragauge_provider_host::{HostConfig, ProviderHost};
 use astragauge_providers::MockProvider;
 use astragauge_sensor_store::SensorStore;
@@ -17,8 +15,11 @@ fn greet(name: &str) -> String {
 #[tauri::command]
 fn get_providers_status(
   host: State<Arc<std::sync::RwLock<ProviderHost>>>,
-) -> Vec<astragauge_provider_host::ProviderStatus> {
-  host.read().unwrap().get_providers_status()
+) -> Result<Vec<astragauge_provider_host::ProviderStatus>, String> {
+  host
+    .read()
+    .map(|h| h.get_providers_status())
+    .map_err(|e| format!("Failed to acquire provider host lock: {}", e))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,14 +63,18 @@ async fn list_available_sensors(
 pub fn run() {
   let store = Arc::new(SensorStore::new());
   let config = HostConfig::default();
-  let host = Arc::new(ProviderHost::new(config, store));
+  let host = Arc::new(std::sync::RwLock::new(ProviderHost::new(config, store)));
 
   let mock_provider = MockProvider::new_test();
-  let mock_provider_arc =
-    Arc::new(Box::new(mock_provider)) as Box<dyn astragauge_provider_host::Provider>;
+  let mock_provider_arc: Arc<Box<dyn astragauge_provider_host::Provider>> =
+    Arc::new(Box::new(mock_provider));
   host
+    .write()
+    .unwrap()
     .register_provider(mock_provider_arc)
     .expect("Failed to register MockProvider");
+
+  host.write().unwrap().start();
 
   tauri::Builder::default()
     .plugin(tauri_plugin_opener::init())
