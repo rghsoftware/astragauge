@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::validation::DomainError;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ProviderCapabilities {
@@ -35,6 +37,32 @@ pub struct ProviderManifest {
   pub runtime: String,
   pub capabilities: ProviderCapabilities,
   pub sensors: SensorCategories,
+}
+
+impl ProviderManifest {
+  /// Validates the manifest for required fields and basic format rules.
+  /// Returns Ok(()) if valid, Err(DomainError) if invalid.
+  pub fn validate(&self) -> Result<(), DomainError> {
+    if self.id.is_empty() {
+      return Err(DomainError::InvalidFormat {
+        message: "provider id cannot be empty".to_string(),
+      });
+    }
+
+    if self.version.is_empty() {
+      return Err(DomainError::InvalidFormat {
+        message: "provider version cannot be empty".to_string(),
+      });
+    }
+
+    if self.runtime.is_empty() {
+      return Err(DomainError::InvalidFormat {
+        message: "provider runtime requirement cannot be empty".to_string(),
+      });
+    }
+
+    Ok(())
+  }
 }
 
 #[cfg(test)]
@@ -186,5 +214,122 @@ categories = ["cpu","memory","disk","network","temperature"]
     let json = serde_json::to_string(&categories).unwrap();
     let parsed: SensorCategories = serde_json::from_str(&json).unwrap();
     assert_eq!(categories, parsed);
+  }
+
+  #[test]
+  fn test_validate_valid_manifest() {
+    let manifest = ProviderManifest {
+      id: "core.linux".to_string(),
+      name: "Linux System Provider".to_string(),
+      version: "0.1.0".to_string(),
+      description: "Test provider".to_string(),
+      author: None,
+      website: None,
+      repository: None,
+      license: None,
+      tags: None,
+      runtime: ">=0.1.0".to_string(),
+      capabilities: ProviderCapabilities {
+        historical: false,
+        high_frequency: true,
+        hardware_access: true,
+      },
+      sensors: SensorCategories { categories: vec![] },
+    };
+
+    assert!(manifest.validate().is_ok());
+  }
+
+  #[test]
+  fn test_validate_empty_id() {
+    let manifest = ProviderManifest {
+      id: "".to_string(),
+      name: "Test Provider".to_string(),
+      version: "0.1.0".to_string(),
+      description: "Test provider".to_string(),
+      author: None,
+      website: None,
+      repository: None,
+      license: None,
+      tags: None,
+      runtime: ">=0.1.0".to_string(),
+      capabilities: ProviderCapabilities {
+        historical: false,
+        high_frequency: false,
+        hardware_access: false,
+      },
+      sensors: SensorCategories { categories: vec![] },
+    };
+
+    let result = manifest.validate();
+    assert!(result.is_err());
+    match result {
+      Err(DomainError::InvalidFormat { message }) => {
+        assert!(message.contains("id cannot be empty"));
+      }
+      _ => panic!("Expected InvalidFormat error for empty id"),
+    }
+  }
+
+  #[test]
+  fn test_validate_empty_version() {
+    let manifest = ProviderManifest {
+      id: "test.provider".to_string(),
+      name: "Test Provider".to_string(),
+      version: "".to_string(),
+      description: "Test provider".to_string(),
+      author: None,
+      website: None,
+      repository: None,
+      license: None,
+      tags: None,
+      runtime: ">=0.1.0".to_string(),
+      capabilities: ProviderCapabilities {
+        historical: false,
+        high_frequency: false,
+        hardware_access: false,
+      },
+      sensors: SensorCategories { categories: vec![] },
+    };
+
+    let result = manifest.validate();
+    assert!(result.is_err());
+    match result {
+      Err(DomainError::InvalidFormat { message }) => {
+        assert!(message.contains("version cannot be empty"));
+      }
+      _ => panic!("Expected InvalidFormat error for empty version"),
+    }
+  }
+
+  #[test]
+  fn test_validate_empty_runtime() {
+    let manifest = ProviderManifest {
+      id: "test.provider".to_string(),
+      name: "Test Provider".to_string(),
+      version: "0.1.0".to_string(),
+      description: "Test provider".to_string(),
+      author: None,
+      website: None,
+      repository: None,
+      license: None,
+      tags: None,
+      runtime: "".to_string(),
+      capabilities: ProviderCapabilities {
+        historical: false,
+        high_frequency: false,
+        hardware_access: false,
+      },
+      sensors: SensorCategories { categories: vec![] },
+    };
+
+    let result = manifest.validate();
+    assert!(result.is_err());
+    match result {
+      Err(DomainError::InvalidFormat { message }) => {
+        assert!(message.contains("runtime requirement cannot be empty"));
+      }
+      _ => panic!("Expected InvalidFormat error for empty runtime"),
+    }
   }
 }
