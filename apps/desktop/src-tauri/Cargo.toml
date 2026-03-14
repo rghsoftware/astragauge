@@ -24,4 +24,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 astragauge-provider-host = { path = "../../../crates/provider-host" }
 astragauge-sensor-store = { path = "../../../crates/sensor-store" }
+astragauge-domain = { path = "../../../crates/domain" }
+astragauge-providers = { path = "../../../crates/providers" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
 
