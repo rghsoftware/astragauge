@@ -515,8 +515,8 @@ impl LinuxProvider {
           // Convert millidegrees to Celsius
           let temp_c = temp_mc as f64 / 1000.0;
 
-          // Create sensor ID
-          let sensor_id_str = format!("{}.temperature", sensor_prefix);
+          // Create sensor ID - must match discovery format (includes device name)
+          let sensor_id_str = format!("{}.{}.temperature", sensor_prefix, device_name);
           if let Ok(id) = SensorId::new(&sensor_id_str) {
             samples.push(SensorSample {
               sensor_id: id,
