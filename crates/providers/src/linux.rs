@@ -268,11 +268,15 @@ impl LinuxProvider {
           || device_name.contains("k10temp")
           || device_name.contains("k8temp")
         {
-          format!("cpu.{}.temperature", device_name)
+          format!("cpu.{}.temp{}.temperature", device_name, index)
         } else if device_name.contains("gpu") || device_name.contains("nvidia") {
-          format!("gpu.{}.temperature", device_name)
+          format!("gpu.{}.temp{}.temperature", device_name, index)
         } else {
-          format!("{}.temperature", device_name.replace(' ', "_"))
+          format!(
+            "{}.temp{}.temperature",
+            device_name.replace(' ', "_"),
+            index
+          )
         };
 
         if let Ok(id) = SensorId::new(&sensor_id) {
@@ -498,6 +502,16 @@ impl LinuxProvider {
             continue;
           }
 
+          let index: String = name
+            .chars()
+            .skip(4)
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+
+          if index.is_empty() {
+            continue;
+          }
+
           // Read temperature value (in millidegrees Celsius)
           let temp_content = match fs::read_to_string(file_entry.path()) {
             Ok(c) => c,
@@ -515,8 +529,11 @@ impl LinuxProvider {
           // Convert millidegrees to Celsius
           let temp_c = temp_mc as f64 / 1000.0;
 
-          // Create sensor ID - must match discovery format (includes device name)
-          let sensor_id_str = format!("{}.{}.temperature", sensor_prefix, device_name);
+          // Create sensor ID - must match discovery format (includes index)
+          let sensor_id_str = format!(
+            "{}.{}.temp{}.temperature",
+            sensor_prefix, device_name, index
+          );
           if let Ok(id) = SensorId::new(&sensor_id_str) {
             samples.push(SensorSample {
               sensor_id: id,

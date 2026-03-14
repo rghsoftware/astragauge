@@ -86,7 +86,14 @@ pub fn run() {
     ])
     .setup(move |_app| {
       tauri::async_runtime::spawn(async move {
-        host_clone.write().unwrap().start();
+        match host_clone.write() {
+          Ok(mut host) => {
+            host.start();
+          }
+          Err(e) => {
+            tracing::error!("Provider host lock poisoned: {}", e);
+          }
+        }
       });
       Ok(())
     })
