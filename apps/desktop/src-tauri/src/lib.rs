@@ -1,7 +1,11 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-use astragauge_provider_host::{HostConfig, ProviderHost};
-use astragauge_sensor_store::SensorStore;
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
+
+use astragauge_provider_host::Provider;
+use astragauge_provider_host::{HostConfig, ProviderHost};
+use astragauge_providers::MockProvider;
+use astragauge_sensor_store::SensorStore;
 use std::sync::Arc;
 use tauri::State;
 
@@ -12,9 +16,9 @@ fn greet(name: &str) -> String {
 
 #[tauri::command]
 fn get_providers_status(
-  host: State<Arc<ProviderHost>>,
+  host: State<Arc<std::sync::RwLock<ProviderHost>>>,
 ) -> Vec<astragauge_provider_host::ProviderStatus> {
-  host.get_providers_status()
+  host.read().unwrap().get_providers_status()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +63,13 @@ pub fn run() {
   let store = Arc::new(SensorStore::new());
   let config = HostConfig::default();
   let host = Arc::new(ProviderHost::new(config, store));
+
+  let mock_provider = MockProvider::new_test();
+  let mock_provider_arc =
+    Arc::new(Box::new(mock_provider)) as Box<dyn astragauge_provider_host::Provider>;
+  host
+    .register_provider(mock_provider_arc)
+    .expect("Failed to register MockProvider");
 
   tauri::Builder::default()
     .plugin(tauri_plugin_opener::init())
