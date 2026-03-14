@@ -155,3 +155,25 @@ Project follows docs-first approach - comprehensive specs exist before implement
 - **Runtime work**: `docs/architecture/runtime.md` → `docs/specs/sensor-store.md`
 - **Widget development**: `docs/development/widget-guidelines.md` → `docs/specs/widget-manifest.md`
 - **Provider development**: `docs/development/provider-guidelines.md` → `docs/specs/sensor-schema.md`
+
+---
+
+## DESIGN CONTEXT
+
+### Users
+AstraGauge users are building local system instrumentation panels to monitor hardware metrics, typically viewed on secondary monitors or small LCD screens. They need clear, readable, and composable elements without overwhelming complexity.
+
+### Brand Personality
+**Voice & Tone:** Precise, Technical, Modern, Calm.
+The aesthetic evokes instrumentation, constellations, and precision measurement. It explicitly avoids gamer RGB styling, industrial SCADA aesthetics, and enterprise DevOps language.
+
+### Aesthetic Direction
+**Theme:** Both Light and Dark Mode should be supported from the start.
+**Visual Tone:** "Calm Density". The design should support dense layouts while remaining readable. This means avoiding excessive borders, heavy gradients, and unnecessary decoration. Animations should be minimal and functional (e.g., value transitions, gauge movements).
+
+### Design Principles
+1. **Instrument First:** Widgets must behave like measurement instruments—presenting the measured value, its context, and optional historical trends clearly.
+2. **Distance Legibility over Strict WCAG:** While accessibility matters, the primary goal is ensuring components (values and labels) remain highly legible from a distance (like on a secondary screen), even if it means slightly bending strict WCAG color contrast rules for certain states (e.g., warning/critical).
+3. **Typography for Precision:** Use monospaced fonts (JetBrains Mono, IBM Plex Mono) for numeric values to prevent jitter during updates, and clean sans-serif (Inter, IBM Plex Sans) for labels.
+4. **Semantic Color Rules:** Never hardcode colors. Always use the semantic role system (`background`, `surface`, `text-primary`, `text-secondary`, `accent`, `good`, `warn`, `critical`) to ensure theme compatibility across both light and dark modes.
+5. **Grid Consistency:** Strictly adhere to the 8px base grid for sizing and snapping widgets to maintain alignment and composability.

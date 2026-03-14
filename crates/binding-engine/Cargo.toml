@@ -1,0 +1,15 @@
+[package]
+name = "astragauge-binding-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+astragauge-domain = { path = "../domain" }
+astragauge-sensor-store = { path = "../sensor-store" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+serde_json = "1"

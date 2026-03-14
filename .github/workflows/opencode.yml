@@ -10,9 +10,10 @@ on:
 jobs:
   opencode:
     if: |
-      contains(github.event.comment.body, '/oc') ||
-      contains(github.event.comment.body, '/opencode') ||
-      github.event_name == 'pull_request'
+      (contains(github.event.comment.body, '/oc') ||
+       contains(github.event.comment.body, '/opencode') ||
+       github.event_name == 'pull_request') &&
+      !contains(github.event.pull_request.labels.*.name, 'reviewed')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -40,3 +41,9 @@ jobs:
             - Look for potential bugs
             - Suggest improvements
             - Follow the project conventions documented in AGENTS.md
+
+      - name: Add reviewed label
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr edit ${{ github.event.pull_request.number }} --add-label "reviewed"
