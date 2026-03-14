@@ -268,9 +268,9 @@ impl LinuxProvider {
           || device_name.contains("k10temp")
           || device_name.contains("k8temp")
         {
-          "cpu.temperature".to_string()
+          format!("cpu.{}.temperature", device_name)
         } else if device_name.contains("gpu") || device_name.contains("nvidia") {
-          "gpu.temperature".to_string()
+          format!("gpu.{}.temperature", device_name)
         } else {
           format!("{}.temperature", device_name.replace(' ', "_"))
         };

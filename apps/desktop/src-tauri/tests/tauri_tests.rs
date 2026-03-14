@@ -20,7 +20,7 @@ pub struct SensorInfo {
   pub name: String,
   pub category: String,
   pub unit: String,
-  pub provider_id: String,
+  pub device_id: String,
 }
 
 /// Helper function that replicates the list_available_sensors command logic
@@ -31,7 +31,7 @@ async fn list_available_sensors_logic(store: &Arc<SensorStore>) -> Result<Vec<Se
   let mut sensors = Vec::new();
   for sensor_id in sensor_ids {
     if let Some(descriptor) = store.get_descriptor(&sensor_id).await {
-      let provider_id = sensor_id
+      let device_id = sensor_id
         .split('.')
         .next()
         .unwrap_or(&sensor_id)
@@ -42,7 +42,7 @@ async fn list_available_sensors_logic(store: &Arc<SensorStore>) -> Result<Vec<Se
         name: descriptor.name,
         category: descriptor.category,
         unit: descriptor.unit,
-        provider_id,
+        device_id,
       });
     }
   }
@@ -151,7 +151,7 @@ async fn list_available_sensors_returns_valid_structure() {
   assert_eq!(sensor.name, "Test Temperature");
   assert_eq!(sensor.category, "temperature");
   assert_eq!(sensor.unit, "celsius");
-  assert_eq!(sensor.provider_id, "test");
+  assert_eq!(sensor.device_id, "test");
 
   // Verify JSON structure
   let json = serde_json::to_string(&sensors).expect("Should serialize to JSON");
@@ -172,13 +172,13 @@ async fn list_available_sensors_returns_valid_structure() {
     "JSON should contain unit"
   );
   assert!(
-    json.contains("\"provider_id\":\"test\""),
-    "JSON should contain provider_id"
+    json.contains("\"device_id\":\"test\""),
+    "JSON should contain device_id"
   );
 }
 
 #[tokio::test]
-async fn list_available_sensors_extracts_provider_id_correctly() {
+async fn list_available_sensors_extracts_device_id_correctly() {
   let store = Arc::new(SensorStore::new());
 
   // Register sensors with different provider prefixes
@@ -215,18 +215,18 @@ async fn list_available_sensors_extracts_provider_id_correctly() {
 
   assert_eq!(sensors.len(), 3);
 
-  // Verify provider_id extraction (first component before dot)
+  // Verify device_id extraction (first component before dot)
   let cpu_sensor = sensors
     .iter()
     .find(|s| s.id == "cpu.core0.temperature")
     .unwrap();
-  assert_eq!(cpu_sensor.provider_id, "cpu");
+  assert_eq!(cpu_sensor.device_id, "cpu");
 
   let gpu_sensor = sensors.iter().find(|s| s.id == "gpu.vram.used").unwrap();
-  assert_eq!(gpu_sensor.provider_id, "gpu");
+  assert_eq!(gpu_sensor.device_id, "gpu");
 
   let system_sensor = sensors.iter().find(|s| s.id == "system.uptime").unwrap();
-  assert_eq!(system_sensor.provider_id, "system");
+  assert_eq!(system_sensor.device_id, "system");
 }
 
 // ============================================================================
@@ -329,7 +329,7 @@ fn sensor_info_serializes_to_expected_json_format() {
     name: "CPU Temperature".to_string(),
     category: "temperature".to_string(),
     unit: "celsius".to_string(),
-    provider_id: "cpu".to_string(),
+    device_id: "cpu".to_string(),
   };
 
   let json = serde_json::to_string(&sensor).expect("Should serialize");
@@ -341,5 +341,5 @@ fn sensor_info_serializes_to_expected_json_format() {
   assert_eq!(parsed["name"], "CPU Temperature");
   assert_eq!(parsed["category"], "temperature");
   assert_eq!(parsed["unit"], "celsius");
-  assert_eq!(parsed["provider_id"], "cpu");
+  assert_eq!(parsed["device_id"], "cpu");
 }

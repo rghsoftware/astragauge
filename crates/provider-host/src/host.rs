@@ -156,7 +156,9 @@ impl ProviderHost {
   ) -> JoinHandle<()> {
     let store = Arc::clone(&self.store);
     let token = self.shutdown_token.clone();
-    let poll_interval = provider.as_ref().poll_interval();
+    let provider_interval = provider.as_ref().poll_interval();
+    let min_interval = std::time::Duration::from_millis(self.config.min_poll_interval_ms);
+    let poll_interval = provider_interval.max(min_interval);
 
     tokio::spawn(async move {
       let discover_result = AssertUnwindSafe(provider.as_ref().discover())
@@ -359,7 +361,13 @@ impl ProviderHost {
       .providers
       .iter()
       .map(|(id, entry)| {
-        let health = entry.health.read().unwrap().clone();
+        let health = entry
+          .health
+          .read()
+          .map(|g| g.clone())
+          .unwrap_or(ProviderHealth::Error {
+            message: "Lock poisoned".to_string(),
+          });
         let sensor_count = entry.sensor_ids.read().map(|ids| ids.len()).unwrap_or(0);
         ProviderStatus {
           id: id.clone(),
