@@ -85,7 +85,9 @@ pub fn run() {
       list_available_sensors
     ])
     .setup(move |_app| {
-      host_clone.write().unwrap().start();
+      tauri::async_runtime::spawn(async move {
+        host_clone.write().unwrap().start();
+      });
       Ok(())
     })
     .run(tauri::generate_context!())
