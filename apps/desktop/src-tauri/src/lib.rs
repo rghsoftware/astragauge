@@ -74,7 +74,7 @@ pub fn run() {
     .register_provider(mock_provider_arc)
     .expect("Failed to register MockProvider");
 
-  host.write().unwrap().start();
+  let host_clone = Arc::clone(&host);
 
   tauri::Builder::default()
     .plugin(tauri_plugin_opener::init())
@@ -84,6 +84,10 @@ pub fn run() {
       get_providers_status,
       list_available_sensors
     ])
+    .setup(move |_app| {
+      host_clone.write().unwrap().start();
+      Ok(())
+    })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
