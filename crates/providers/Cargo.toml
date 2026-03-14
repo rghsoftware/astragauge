@@ -9,3 +9,4 @@ astragauge-provider-host = { path = "../provider-host" }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
