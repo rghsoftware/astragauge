@@ -62,6 +62,7 @@ async fn list_available_sensors(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let store = Arc::new(SensorStore::new());
+  let store_clone = Arc::clone(&store);
   let config = HostConfig::default();
   let host = Arc::new(std::sync::RwLock::new(ProviderHost::new(config, store)));
 
@@ -79,6 +80,7 @@ pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_opener::init())
     .manage(host)
+    .manage(store_clone)
     .invoke_handler(tauri::generate_handler![
       greet,
       get_providers_status,

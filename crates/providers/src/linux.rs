@@ -263,21 +263,7 @@ impl LinuxProvider {
           .ok()
           .map(|s| s.trim().to_string());
 
-        let sensor_id = if device_name.contains("coretemp")
-          || device_name.contains("cpu")
-          || device_name.contains("k10temp")
-          || device_name.contains("k8temp")
-        {
-          format!("cpu.{}.temp{}.temperature", device_name, index)
-        } else if device_name.contains("gpu") || device_name.contains("nvidia") {
-          format!("gpu.{}.temp{}.temperature", device_name, index)
-        } else {
-          format!(
-            "{}.temp{}.temperature",
-            device_name.replace(' ', "_"),
-            index
-          )
-        };
+        let sensor_id = Self::make_temp_sensor_id(device_name, &index);
 
         if let Ok(id) = SensorId::new(&sensor_id) {
           let display_name = label.unwrap_or_else(|| format!("{} Temperature", device_name));
@@ -295,6 +281,24 @@ impl LinuxProvider {
     }
 
     sensors
+  }
+
+  fn make_temp_sensor_id(device_name: &str, index: &str) -> String {
+    if device_name.contains("coretemp")
+      || device_name.contains("cpu")
+      || device_name.contains("k10temp")
+      || device_name.contains("k8temp")
+    {
+      format!("cpu.{}.temp{}.temperature", device_name, index)
+    } else if device_name.contains("gpu") || device_name.contains("nvidia") {
+      format!("gpu.{}.temp{}.temperature", device_name, index)
+    } else {
+      format!(
+        "{}.temp{}.temperature",
+        device_name.replace(' ', "_"),
+        index
+      )
+    }
   }
 
   /// Get current timestamp in milliseconds since UNIX epoch.
@@ -479,19 +483,6 @@ impl LinuxProvider {
         Err(_) => continue,
       };
 
-      // Determine sensor ID prefix based on device name
-      let sensor_prefix = if device_name.contains("coretemp")
-        || device_name.contains("cpu")
-        || device_name.contains("k10temp")
-        || device_name.contains("k8temp")
-      {
-        "cpu"
-      } else if device_name.contains("gpu") || device_name.contains("nvidia") {
-        "gpu"
-      } else {
-        &device_name.replace(' ', "_")
-      };
-
       // Find and read temperature input files
       if let Ok(dir_entries) = fs::read_dir(&hwmon_dir) {
         for file_entry in dir_entries.flatten() {
@@ -529,11 +520,7 @@ impl LinuxProvider {
           // Convert millidegrees to Celsius
           let temp_c = temp_mc as f64 / 1000.0;
 
-          // Create sensor ID - must match discovery format (includes index)
-          let sensor_id_str = format!(
-            "{}.{}.temp{}.temperature",
-            sensor_prefix, device_name, index
-          );
+          let sensor_id_str = Self::make_temp_sensor_id(&device_name, &index);
           if let Ok(id) = SensorId::new(&sensor_id_str) {
             samples.push(SensorSample {
               sensor_id: id,

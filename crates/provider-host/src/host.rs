@@ -97,6 +97,36 @@ impl ProviderHost {
     self.shutdown_token.cancel();
 
     let timeout_duration = tokio::time::Duration::from_millis(self.config.shutdown_timeout_ms);
+
+    for (id, entry) in &self.providers {
+      let provider = Arc::clone(&entry.provider);
+      tracing::debug!("Calling shutdown() for provider {}...", id);
+
+      let shutdown_result =
+        AssertUnwindSafe(tokio::time::timeout(timeout_duration, provider.shutdown()))
+          .catch_unwind()
+          .await;
+
+      match shutdown_result {
+        Ok(Ok(Ok(()))) => {
+          tracing::debug!("Provider {} shutdown() successful", id);
+        }
+        Ok(Ok(Err(e))) => {
+          tracing::error!("Provider {} shutdown() failed: {:?}", id, e);
+        }
+        Ok(Err(_)) => {
+          tracing::warn!(
+            "Provider {} shutdown() timed out after {}ms",
+            id,
+            self.config.shutdown_timeout_ms
+          );
+        }
+        Err(_) => {
+          tracing::error!("Provider {} shutdown() panicked", id);
+        }
+      }
+    }
+
     let mut finished = 0;
     let mut timed_out = 0;
 
