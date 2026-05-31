@@ -14,16 +14,25 @@ use astragauge_domain::{
 };
 use astragauge_provider_host::{Provider, ProviderHealth, ProviderResult};
 
-/// Parameters for a time-varying demo sensor: descriptor plus the
-/// (base, amplitude, period_ms) used to compute a sine-based value, clamped
-/// to the sensor's plausible [clamp_min, clamp_max] range.
-struct DemoSensor {
-  descriptor: SensorDescriptor,
+/// A sine wave: `base + amplitude * sin(2*pi*(now_ms % period_ms) / period_ms)`.
+struct Wave {
   base: f64,
   amplitude: f64,
   period_ms: u64,
-  clamp_min: f64,
-  clamp_max: f64,
+}
+
+/// Inclusive clamp bounds for a sensor's plausible value range.
+struct Range {
+  min: f64,
+  max: f64,
+}
+
+/// Parameters for a time-varying demo sensor: descriptor plus the wave that
+/// generates its value, clamped to the sensor's plausible range.
+struct DemoSensor {
+  descriptor: SensorDescriptor,
+  wave: Wave,
+  clamp: Range,
 }
 
 /// A mock provider for testing that returns configurable sensor data.
@@ -88,14 +97,13 @@ impl MockProvider {
   ///
   /// Poll interval is 500ms.
   pub fn new_demo() -> Self {
-    // (base, amplitude, period_ms) describe the sine wave; (min, max) clamp it.
     fn demo(
       id: &str,
       name: &str,
       category: &str,
       unit: &str,
-      wave: (f64, f64, u64),
-      clamp: (f64, f64),
+      wave: Wave,
+      clamp: Range,
     ) -> DemoSensor {
       DemoSensor {
         descriptor: SensorDescriptor {
@@ -106,11 +114,8 @@ impl MockProvider {
           device: None,
           tags: vec![],
         },
-        base: wave.0,
-        amplitude: wave.1,
-        period_ms: wave.2,
-        clamp_min: clamp.0,
-        clamp_max: clamp.1,
+        wave,
+        clamp,
       }
     }
 
@@ -121,24 +126,45 @@ impl MockProvider {
         "CPU Utilization",
         "utilization",
         "%",
-        (45.0, 38.0, 7000),
-        (0.0, 100.0),
+        Wave {
+          base: 45.0,
+          amplitude: 38.0,
+          period_ms: 7000,
+        },
+        Range {
+          min: 0.0,
+          max: 100.0,
+        },
       ),
       demo(
         "cpu.clock",
         "CPU Clock",
         "frequency",
         "MHz",
-        (4100.0, 700.0, 6500),
-        (800.0, 5200.0),
+        Wave {
+          base: 4100.0,
+          amplitude: 700.0,
+          period_ms: 6500,
+        },
+        Range {
+          min: 800.0,
+          max: 5200.0,
+        },
       ),
       demo(
         "cpu.temperature",
         "CPU Temperature",
         "temperature",
         "°C",
-        (55.0, 18.0, 11000),
-        (20.0, 95.0),
+        Wave {
+          base: 55.0,
+          amplitude: 18.0,
+          period_ms: 11000,
+        },
+        Range {
+          min: 20.0,
+          max: 95.0,
+        },
       ),
       // GPU
       demo(
@@ -146,16 +172,30 @@ impl MockProvider {
         "GPU Utilization",
         "utilization",
         "%",
-        (40.0, 40.0, 9000),
-        (0.0, 100.0),
+        Wave {
+          base: 40.0,
+          amplitude: 40.0,
+          period_ms: 9000,
+        },
+        Range {
+          min: 0.0,
+          max: 100.0,
+        },
       ),
       demo(
         "gpu.temperature",
         "GPU Temperature",
         "temperature",
         "°C",
-        (50.0, 22.0, 13000),
-        (20.0, 95.0),
+        Wave {
+          base: 50.0,
+          amplitude: 22.0,
+          period_ms: 13000,
+        },
+        Range {
+          min: 20.0,
+          max: 95.0,
+        },
       ),
       // Memory
       demo(
@@ -163,16 +203,30 @@ impl MockProvider {
         "Memory Used",
         "utilization",
         "%",
-        (60.0, 20.0, 17000),
-        (0.0, 100.0),
+        Wave {
+          base: 60.0,
+          amplitude: 20.0,
+          period_ms: 17000,
+        },
+        Range {
+          min: 0.0,
+          max: 100.0,
+        },
       ),
       demo(
         "memory.used",
         "Memory Used",
         "memory",
         "MB",
-        (19000.0, 4500.0, 17000),
-        (2048.0, 32768.0),
+        Wave {
+          base: 19000.0,
+          amplitude: 4500.0,
+          period_ms: 17000,
+        },
+        Range {
+          min: 2048.0,
+          max: 32768.0,
+        },
       ),
     ];
 
@@ -236,9 +290,9 @@ impl Provider for MockProvider {
         .demo_sensors
         .iter()
         .map(|s| {
-          let phase = (timestamp_ms % s.period_ms) as f64 / s.period_ms as f64;
-          let value =
-            (s.base + s.amplitude * (2.0 * PI * phase).sin()).clamp(s.clamp_min, s.clamp_max);
+          let phase = (timestamp_ms % s.wave.period_ms) as f64 / s.wave.period_ms as f64;
+          let value = (s.wave.base + s.wave.amplitude * (2.0 * PI * phase).sin())
+            .clamp(s.clamp.min, s.clamp.max);
           SensorSample {
             sensor_id: s.descriptor.id.clone(),
             timestamp_ms,
