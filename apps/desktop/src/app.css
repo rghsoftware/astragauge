@@ -1,0 +1,74 @@
+/* AstraGauge global theme tokens and base styles.
+   Variable names are FIXED per the binding contract — widgets reference
+   these exact --ag-* custom properties. Do NOT hardcode colors elsewhere. */
+
+:root {
+  /* Color roles — dark theme (default) */
+  --ag-background: #0f1115;
+  --ag-surface: #1a1e24;
+  --ag-surface-raised: #232831;
+  --ag-text-primary: #ffffff;
+  --ag-text-secondary: #9aa4b2;
+  --ag-accent: #4fa3ff;
+  --ag-good: #4cd964;
+  --ag-warn: #ffc857;
+  --ag-critical: #ff4d4d;
+  --ag-border: rgba(255, 255, 255, 0.08);
+
+  /* Typography (same across themes) */
+  --ag-font-primary: 'Inter', system-ui, -apple-system, sans-serif;
+  --ag-font-numeric: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+
+  /* Spacing & shape (same across themes) */
+  --ag-grid: 8px;
+  --ag-widget-padding: 12px;
+  --ag-radius: 8px;
+}
+
+[data-theme='light'] {
+  /* Color roles — light theme */
+  --ag-background: #f6f7f9;
+  --ag-surface: #ffffff;
+  --ag-surface-raised: #ffffff;
+  --ag-text-primary: #0f1115;
+  --ag-text-secondary: #5a6472;
+  --ag-accent: #2d7dd2;
+  --ag-good: #2ba84a;
+  --ag-warn: #c8860b;
+  --ag-critical: #d93535;
+  --ag-border: rgba(0, 0, 0, 0.1);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100vh;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--ag-background);
+  color: var(--ag-text-primary);
+  font-family: var(--ag-font-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* Smooth transition when toggling themes */
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+
+/* Apply the same smooth color transition to themed surfaces/text */
+:root,
+[data-theme='light'] {
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
