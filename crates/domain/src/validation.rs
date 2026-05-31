@@ -51,11 +51,11 @@ impl SensorId {
     }
 
     for c in id.chars() {
-      if c != '.' && !c.is_ascii_lowercase() && !c.is_ascii_digit() {
+      if c != '.' && c != '-' && !c.is_ascii_lowercase() && !c.is_ascii_digit() {
         return Err(DomainError::InvalidSensorId {
           id: id.clone(),
           reason: format!(
-            "contains invalid character '{}' (only lowercase letters, digits, and dots allowed)",
+            "contains invalid character '{}' (only lowercase letters, digits, hyphens, and dots allowed)",
             c
           ),
         });
@@ -68,6 +68,13 @@ impl SensorId {
       return Err(DomainError::InvalidSensorId {
         id: id.clone(),
         reason: "cannot have empty segments (no leading/trailing/consecutive dots)".to_string(),
+      });
+    }
+
+    if segments.iter().any(|s| s.starts_with('-') || s.ends_with('-')) {
+      return Err(DomainError::InvalidSensorId {
+        id: id.clone(),
+        reason: "segments cannot start or end with a hyphen".to_string(),
       });
     }
 
@@ -119,6 +126,8 @@ mod tests {
     assert!(SensorId::new("gpu.utilization").is_ok());
     assert!(SensorId::new("cpu.core0.frequency").is_ok());
     assert!(SensorId::new("gpu.vram.controller.temperature").is_ok());
+    assert!(SensorId::new("cpu-core0.temperature").is_ok());
+    assert!(SensorId::new("net-eth0.rx-bytes").is_ok());
   }
 
   #[test]
@@ -218,15 +227,22 @@ mod tests {
   }
 
   #[test]
-  fn test_invalid_hyphen() {
-    let result = SensorId::new("cpu-core-0.temperature");
+  fn test_valid_hyphenated_sensor_ids() {
+    assert!(SensorId::new("cpu-core-0.temperature").is_ok());
+    assert!(SensorId::new("gpu-memory.used").is_ok());
+    assert!(SensorId::new("net-if-eth0.rx-bytes").is_ok());
+  }
+
+  #[test]
+  fn test_invalid_segment_starts_with_hyphen() {
+    let result = SensorId::new("cpu.-temperature");
     assert!(result.is_err());
-    match result {
-      Err(DomainError::InvalidSensorId { reason, .. }) => {
-        assert!(reason.contains("invalid character"));
-      }
-      _ => panic!("Expected InvalidSensorId error"),
-    }
+  }
+
+  #[test]
+  fn test_invalid_segment_ends_with_hyphen() {
+    let result = SensorId::new("cpu-.temperature");
+    assert!(result.is_err());
   }
 
   #[test]

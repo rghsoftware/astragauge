@@ -3,6 +3,7 @@
 //! This module contains all types needed to parse and represent widget manifests
 //! as defined in the widget-manifest spec.
 
+use crate::validation::DomainError;
 use serde::{Deserialize, Serialize};
 
 /// How a widget responds to container resize operations.
@@ -172,6 +173,73 @@ pub struct WidgetManifest {
   pub theming: Theming,
   pub capabilities: Capabilities,
   pub validation: Validation,
+}
+
+impl WidgetManifest {
+  pub fn validate(&self) -> Result<(), DomainError> {
+    if self.id.is_empty() {
+      return Err(DomainError::InvalidFormat {
+        message: "widget id cannot be empty".to_string(),
+      });
+    }
+    if self.name.is_empty() {
+      return Err(DomainError::InvalidFormat {
+        message: "widget name cannot be empty".to_string(),
+      });
+    }
+    if self.category.is_empty() {
+      return Err(DomainError::InvalidFormat {
+        message: "widget category cannot be empty".to_string(),
+      });
+    }
+    if self.version == 0 {
+      return Err(DomainError::InvalidFormat {
+        message: "widget version must be greater than 0".to_string(),
+      });
+    }
+    if self.sizing.default_w < self.sizing.min_w {
+      return Err(DomainError::InvalidFormat {
+        message: format!(
+          "default_w ({}) must be >= min_w ({})",
+          self.sizing.default_w, self.sizing.min_w
+        ),
+      });
+    }
+    if self.sizing.default_h < self.sizing.min_h {
+      return Err(DomainError::InvalidFormat {
+        message: format!(
+          "default_h ({}) must be >= min_h ({})",
+          self.sizing.default_h, self.sizing.min_h
+        ),
+      });
+    }
+    if let Some(max_w) = self.sizing.max_w {
+      if max_w < self.sizing.default_w {
+        return Err(DomainError::InvalidFormat {
+          message: format!(
+            "max_w ({}) must be >= default_w ({})",
+            max_w, self.sizing.default_w
+          ),
+        });
+      }
+    }
+    if let Some(max_h) = self.sizing.max_h {
+      if max_h < self.sizing.default_h {
+        return Err(DomainError::InvalidFormat {
+          message: format!(
+            "max_h ({}) must be >= default_h ({})",
+            max_h, self.sizing.default_h
+          ),
+        });
+      }
+    }
+    if self.validation.requires_value_binding && self.bindings.is_empty() {
+      return Err(DomainError::InvalidFormat {
+        message: "widget requires value binding but has no bindings defined".to_string(),
+      });
+    }
+    Ok(())
+  }
 }
 
 #[cfg(test)]
@@ -428,5 +496,122 @@ mod tests {
     assert!(manifest.bindings.is_empty());
     assert!(manifest.validation.required_props.is_empty());
     assert!(manifest.validation.layout_rules.is_none());
+  }
+
+  #[test]
+  fn validate_rejects_empty_id() {
+    let manifest = minimal_manifest_with_id("");
+    let err = manifest.validate().unwrap_err();
+    assert!(matches!(err, DomainError::InvalidFormat { .. }));
+    assert!(err.to_string().contains("id"));
+  }
+
+  #[test]
+  fn validate_rejects_empty_name() {
+    let manifest = minimal_manifest_with_fields("test.widget", "", "test");
+    let err = manifest.validate().unwrap_err();
+    assert!(err.to_string().contains("name"));
+  }
+
+  #[test]
+  fn validate_rejects_empty_category() {
+    let manifest = minimal_manifest_with_fields("test.widget", "Test", "");
+    let err = manifest.validate().unwrap_err();
+    assert!(err.to_string().contains("category"));
+  }
+
+  #[test]
+  fn validate_rejects_zero_version() {
+    let mut manifest = minimal_manifest_with_id("test.widget");
+    manifest.version = 0;
+    let err = manifest.validate().unwrap_err();
+    assert!(err.to_string().contains("version"));
+  }
+
+  #[test]
+  fn validate_rejects_default_w_less_than_min_w() {
+    let mut manifest = minimal_manifest_with_id("test.widget");
+    manifest.sizing.default_w = 1;
+    manifest.sizing.min_w = 2;
+    let err = manifest.validate().unwrap_err();
+    assert!(err.to_string().contains("default_w"));
+  }
+
+  #[test]
+  fn validate_rejects_max_w_less_than_default_w() {
+    let mut manifest = minimal_manifest_with_id("test.widget");
+    manifest.sizing.max_w = Some(0);
+    let err = manifest.validate().unwrap_err();
+    assert!(err.to_string().contains("max_w"));
+  }
+
+  #[test]
+  fn validate_rejects_requires_binding_but_no_bindings() {
+    let mut manifest = minimal_manifest_with_id("test.widget");
+    manifest.validation.requires_value_binding = true;
+    let err = manifest.validate().unwrap_err();
+    assert!(err.to_string().contains("binding"));
+  }
+
+  #[test]
+  fn validate_accepts_valid_stat_tile() {
+    let manifest: WidgetManifest =
+      serde_json::from_str(STAT_TILE_MANIFEST).unwrap();
+    assert!(manifest.validate().is_ok());
+  }
+
+  fn minimal_manifest_with_id(id: &str) -> WidgetManifest {
+    WidgetManifest {
+      id: id.to_string(),
+      name: "Test Widget".to_string(),
+      category: "test".to_string(),
+      version: 1,
+      description: None,
+      sizing: Sizing {
+        default_w: 1,
+        default_h: 1,
+        min_w: 1,
+        min_h: 1,
+        max_w: None,
+        max_h: None,
+        resize_mode: ResizeMode::Fixed,
+      },
+      properties: vec![],
+      bindings: vec![],
+      preview: Preview {
+        mock_kind: MockKind::Text,
+        sample_props: None,
+        sample_bindings: None,
+        placeholder_label: None,
+      },
+      theming: Theming {
+        supports_background: false,
+        supports_accent: false,
+        supports_threshold_colors: false,
+        supports_typography_roles: false,
+        style_slots: vec![],
+      },
+      capabilities: Capabilities {
+        supports_history: false,
+        supports_thresholds: false,
+        supports_multiple_series: false,
+        supports_secondary_text: false,
+        supports_overlay: false,
+      },
+      validation: Validation {
+        requires_value_binding: false,
+        min_supported_bindings: None,
+        max_supported_bindings: None,
+        required_props: vec![],
+        layout_rules: None,
+      },
+    }
+  }
+
+  fn minimal_manifest_with_fields(id: &str, name: &str, category: &str) -> WidgetManifest {
+    let mut m = minimal_manifest_with_id(id);
+    m.name = name.to_string();
+    m.category = category.to_string();
+    m
   }
 }
