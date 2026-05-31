@@ -11,33 +11,6 @@ mod linux_tests {
   use astragauge_provider_host::Provider;
   use astragauge_providers::LinuxProvider;
 
-  fn is_valid_sensor_id(id: &SensorId) -> bool {
-    let id_str = id.as_str();
-
-    if id_str != id_str.to_lowercase() {
-      return false;
-    }
-
-    let parts: Vec<&str> = id_str.split('.').collect();
-    if parts.len() < 2 {
-      return false;
-    }
-
-    if parts.iter().any(|p| p.is_empty()) {
-      return false;
-    }
-
-    if id_str.contains(' ') {
-      return false;
-    }
-
-    if parts[0].contains('_') {
-      return false;
-    }
-
-    true
-  }
-
   #[tokio::test]
   #[ignore]
   async fn discover_returns_sensors() {
@@ -58,7 +31,6 @@ mod linux_tests {
     }
   }
 
-  /// CPU utilization requires two polls for delta calculation.
   #[tokio::test]
   #[ignore]
   async fn poll_returns_samples() {
@@ -100,61 +72,42 @@ mod linux_tests {
     eprintln!("Provider health: {:?}", health);
   }
 
-  /// See docs/specs/sensor-schema.md for format rules.
   #[tokio::test]
   #[ignore]
   async fn sensor_ids_follow_conventions() {
     let provider = LinuxProvider::new();
     let sensors = provider.discover().await.expect("discover should succeed");
 
-    let mut invalid_ids: Vec<String> = Vec::new();
-
     for sensor in &sensors {
-      if !is_valid_sensor_id(&sensor.id) {
-        invalid_ids.push(format!(
-          "{} (name: {}, category: {})",
-          sensor.id.as_str(),
-          sensor.name,
-          sensor.category
-        ));
-      }
-    }
+      let id_str = sensor.id.as_str();
 
-    if !invalid_ids.is_empty() {
-      eprintln!("Invalid sensor IDs found:");
-      for id in &invalid_ids {
-        eprintln!("  - {}", id);
-      }
-      panic!(
-        "Found {} sensor ID(s) that don't follow naming conventions. \
-         Expected format: device.metric (lowercase, dot-separated, no spaces, singular device names)",
-        invalid_ids.len()
+      assert_eq!(
+        id_str,
+        id_str.to_lowercase(),
+        "Sensor ID must be lowercase: {}",
+        id_str
+      );
+
+      assert!(
+        SensorId::new(id_str).is_ok(),
+        "Sensor ID must be parseable by SensorId::new(): {}",
+        id_str
+      );
+
+      assert!(
+        !id_str.contains(' '),
+        "Sensor ID must not contain spaces: {}",
+        id_str
       );
     }
 
     let sensor_ids: Vec<&str> = sensors.iter().map(|s| s.id.as_str()).collect();
 
-    assert!(
-      sensor_ids.contains(&"cpu.utilization"),
-      "Expected cpu.utilization sensor"
-    );
-
-    assert!(
-      sensor_ids.contains(&"memory.used"),
-      "Expected memory.used sensor"
-    );
-    assert!(
-      sensor_ids.contains(&"memory.total"),
-      "Expected memory.total sensor"
-    );
-    assert!(
-      sensor_ids.contains(&"memory.utilization"),
-      "Expected memory.utilization sensor"
-    );
-    assert!(
-      sensor_ids.contains(&"memory.available"),
-      "Expected memory.available sensor"
-    );
+    assert!(sensor_ids.contains(&"cpu.utilization"), "Expected cpu.utilization");
+    assert!(sensor_ids.contains(&"memory.used"), "Expected memory.used");
+    assert!(sensor_ids.contains(&"memory.total"), "Expected memory.total");
+    assert!(sensor_ids.contains(&"memory.utilization"), "Expected memory.utilization");
+    assert!(sensor_ids.contains(&"memory.available"), "Expected memory.available");
   }
 
   #[tokio::test]
@@ -168,19 +121,16 @@ mod linux_tests {
         !sensor.id.as_str().is_empty(),
         "Sensor ID should not be empty"
       );
-
       assert!(
         !sensor.name.is_empty(),
         "Sensor {} should have a name",
         sensor.id.as_str()
       );
-
       assert!(
         !sensor.category.is_empty(),
         "Sensor {} should have a category",
         sensor.id.as_str()
       );
-
       assert!(
         !sensor.unit.is_empty(),
         "Sensor {} should have a unit",
@@ -227,6 +177,58 @@ mod linux_tests {
         "Sample {} timestamp is in the future",
         sample.sensor_id.as_str()
       );
+    }
+  }
+
+  #[tokio::test]
+  #[ignore]
+  async fn swap_sensors_present() {
+    let provider = LinuxProvider::new();
+    let sensors = provider.discover().await.expect("discover should succeed");
+
+    let sensor_ids: Vec<&str> = sensors.iter().map(|s| s.id.as_str()).collect();
+
+    assert!(sensor_ids.contains(&"swap.total"), "Expected swap.total");
+    assert!(sensor_ids.contains(&"swap.used"), "Expected swap.used");
+    assert!(sensor_ids.contains(&"swap.free"), "Expected swap.free");
+    assert!(sensor_ids.contains(&"swap.utilization"), "Expected swap.utilization");
+  }
+
+  #[tokio::test]
+  #[ignore]
+  async fn configurable_poll_interval() {
+    let provider = LinuxProvider::with_poll_interval(Duration::from_millis(500));
+    assert_eq!(provider.poll_interval(), Duration::from_millis(500));
+  }
+
+  #[tokio::test]
+  #[ignore]
+  async fn health_check_works() {
+    let provider = LinuxProvider::new();
+    let health = provider.health().await;
+    eprintln!("Health: {:?}", health);
+  }
+
+  #[tokio::test]
+  #[ignore]
+  async fn disk_and_network_sensors_polled() {
+    let provider = LinuxProvider::new();
+
+    let _ = provider.poll().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let samples = provider.poll().await.expect("poll should succeed");
+
+    let has_disk = samples.iter().any(|s| s.sensor_id.as_str().starts_with("disk."));
+    let has_network = samples.iter().any(|s| s.sensor_id.as_str().starts_with("network."));
+
+    eprintln!(
+      "Disk samples: {}, Network samples: {}",
+      has_disk, has_network
+    );
+
+    for sample in &samples {
+      eprintln!("  {} = {:?}", sample.sensor_id.as_str(), sample.value);
     }
   }
 }

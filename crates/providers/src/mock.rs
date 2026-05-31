@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use astragauge_domain::{
@@ -13,16 +14,24 @@ use astragauge_domain::{
 };
 use astragauge_provider_host::{Provider, ProviderHealth, ProviderResult};
 
-/// A mock provider for testing that returns configurable sensor data.
+#[derive(Clone)]
+enum MockPollBehavior {
+  Normal,
+  Fail(String),
+  FailAfter { count: usize, message: String },
+}
+
 pub struct MockProvider {
   descriptors: Vec<SensorDescriptor>,
   values: HashMap<SensorId, f64>,
   poll_interval: Duration,
   manifest: ProviderManifest,
+  health_state: Arc<Mutex<ProviderHealth>>,
+  poll_behavior: Arc<Mutex<MockPollBehavior>>,
+  poll_count: Arc<Mutex<usize>>,
 }
 
 impl MockProvider {
-  /// Creates a new MockProvider with the given configuration.
   pub fn with_sensors(
     descriptors: Vec<SensorDescriptor>,
     values: HashMap<SensorId, f64>,
@@ -33,14 +42,12 @@ impl MockProvider {
       descriptors,
       values,
       poll_interval,
+      health_state: Arc::new(Mutex::new(ProviderHealth::Ok)),
+      poll_behavior: Arc::new(Mutex::new(MockPollBehavior::Normal)),
+      poll_count: Arc::new(Mutex::new(0)),
     }
   }
 
-  /// Creates a MockProvider with sensible defaults for testing.
-  ///
-  /// Default configuration:
-  /// - 1 sensor: `mock.sensor` with value 42.0
-  /// - 10ms poll interval
   pub fn new_test() -> Self {
     let sensor_id = SensorId::new("mock.sensor").expect("valid sensor id");
     let descriptor = SensorDescriptor {
@@ -60,7 +67,29 @@ impl MockProvider {
       descriptors: vec![descriptor],
       values,
       poll_interval: Duration::from_millis(10),
+      health_state: Arc::new(Mutex::new(ProviderHealth::Ok)),
+      poll_behavior: Arc::new(Mutex::new(MockPollBehavior::Normal)),
+      poll_count: Arc::new(Mutex::new(0)),
     }
+  }
+
+  pub fn set_health(&self, health: ProviderHealth) {
+    *self.health_state.lock().unwrap() = health;
+  }
+
+  pub fn set_poll_failure(&self, message: impl Into<String>) {
+    *self.poll_behavior.lock().unwrap() = MockPollBehavior::Fail(message.into());
+  }
+
+  pub fn set_poll_failure_after(&self, successful_count: usize, message: impl Into<String>) {
+    *self.poll_behavior.lock().unwrap() = MockPollBehavior::FailAfter {
+      count: successful_count,
+      message: message.into(),
+    };
+  }
+
+  pub fn poll_count(&self) -> usize {
+    *self.poll_count.lock().unwrap()
   }
 }
 
@@ -102,6 +131,22 @@ impl Provider for MockProvider {
   }
 
   async fn poll(&self) -> ProviderResult<Vec<SensorSample>> {
+    *self.poll_count.lock().unwrap() += 1;
+
+    let behavior = self.poll_behavior.lock().unwrap().clone();
+    match behavior {
+      MockPollBehavior::Fail(msg) => {
+        return Err(astragauge_provider_host::ProviderError::PollFailed { message: msg });
+      }
+      MockPollBehavior::FailAfter { count, message } => {
+        let current = *self.poll_count.lock().unwrap();
+        if current > count {
+          return Err(astragauge_provider_host::ProviderError::PollFailed { message });
+        }
+      }
+      MockPollBehavior::Normal => {}
+    }
+
     let timestamp_ms = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .map(|d| d.as_millis() as u64)
@@ -121,7 +166,7 @@ impl Provider for MockProvider {
   }
 
   async fn health(&self) -> ProviderHealth {
-    ProviderHealth::Ok
+    self.health_state.lock().unwrap().clone()
   }
 
   async fn shutdown(&self) -> ProviderResult<()> {
@@ -198,5 +243,73 @@ mod tests {
     let manifest = provider.manifest();
     assert_eq!(manifest.id, "mock.provider");
     assert_eq!(manifest.name, "Mock Provider");
+  }
+
+  #[tokio::test]
+  async fn test_configurable_health_degraded() {
+    let provider = MockProvider::new_test();
+    provider.set_health(ProviderHealth::Degraded {
+      message: "sensor unstable".to_string(),
+    });
+    let health = provider.health().await;
+    assert_eq!(
+      health,
+      ProviderHealth::Degraded {
+        message: "sensor unstable".to_string()
+      }
+    );
+  }
+
+  #[tokio::test]
+  async fn test_configurable_health_error() {
+    let provider = MockProvider::new_test();
+    provider.set_health(ProviderHealth::Error {
+      message: "device offline".to_string(),
+    });
+    let health = provider.health().await;
+    assert_eq!(
+      health,
+      ProviderHealth::Error {
+        message: "device offline".to_string()
+      }
+    );
+  }
+
+  #[tokio::test]
+  async fn test_poll_failure_simulation() {
+    let provider = MockProvider::new_test();
+    provider.set_poll_failure("simulated failure");
+    let result = provider.poll().await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    match err {
+      astragauge_provider_host::ProviderError::PollFailed { message: msg } => {
+        assert_eq!(msg, "simulated failure");
+      }
+      _ => panic!("expected PollFailed error"),
+    }
+  }
+
+  #[tokio::test]
+  async fn test_poll_failure_after_count() {
+    let provider = MockProvider::new_test();
+    provider.set_poll_failure_after(2, "transient failure");
+
+    assert!(provider.poll().await.is_ok());
+    assert!(provider.poll().await.is_ok());
+
+    let result = provider.poll().await;
+    assert!(result.is_err());
+    assert_eq!(provider.poll_count(), 3);
+  }
+
+  #[tokio::test]
+  async fn test_poll_count_tracks_calls() {
+    let provider = MockProvider::new_test();
+    assert_eq!(provider.poll_count(), 0);
+    let _ = provider.poll().await;
+    assert_eq!(provider.poll_count(), 1);
+    let _ = provider.poll().await;
+    assert_eq!(provider.poll_count(), 2);
   }
 }

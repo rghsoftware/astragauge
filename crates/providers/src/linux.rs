@@ -1,17 +1,16 @@
-//! Linux system provider - reads from /proc, /sys/class/hwmon for CPU, memory, and temperature sensors.
+//! Linux system provider - reads from /proc, /sys/class/hwmon for CPU, memory,
+//! swap, disk, network, and temperature sensors.
 
 #[cfg(target_os = "linux")]
 use async_trait::async_trait;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
-use std::fs;
-#[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use astragauge_domain::{
@@ -21,8 +20,6 @@ use astragauge_domain::{
 #[cfg(target_os = "linux")]
 use astragauge_provider_host::{Provider, ProviderHealth, ProviderResult};
 
-/// CPU statistics from /proc/stat for utilization calculation.
-/// Stores cumulative time values in jiffies (typically 1/100 second).
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, Default)]
 struct CpuStats {
@@ -40,8 +37,6 @@ struct CpuStats {
 
 #[cfg(target_os = "linux")]
 impl CpuStats {
-  /// Calculate CPU utilization percentage from current and previous stats.
-  /// Returns None if delta is zero (no change between readings).
   fn utilization_from(prev: CpuStats, curr: CpuStats) -> Option<f64> {
     let prev_idle = prev.idle + prev.iowait;
     let curr_idle = curr.idle + curr.iowait;
@@ -78,74 +73,178 @@ impl CpuStats {
     let utilization = ((delta_total - delta_idle) as f64 / delta_total as f64) * 100.0;
     Some(utilization.clamp(0.0, 100.0))
   }
+
+  fn parse_from_line(line: &str) -> Option<CpuStats> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 8 || parts[0] != "cpu" {
+      return None;
+    }
+
+    let parse_u64 =
+      |idx: usize| -> u64 { parts.get(idx).and_then(|s| s.parse().ok()).unwrap_or(0) };
+
+    Some(CpuStats {
+      user: parse_u64(1),
+      nice: parse_u64(2),
+      system: parse_u64(3),
+      idle: parse_u64(4),
+      iowait: parse_u64(5),
+      irq: parse_u64(6),
+      softirq: parse_u64(7),
+      steal: parse_u64(8),
+      guest: parse_u64(9),
+      guest_nice: parse_u64(10),
+    })
+  }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct DiskStats {
+  sectors_read: u64,
+  sectors_written: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl DiskStats {
+  fn parse_from_line(line: &str) -> Option<(String, DiskStats)> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 10 {
+      return None;
+    }
+
+    let name = parts.get(2)?.to_string();
+
+    let parse_u64 =
+      |idx: usize| -> u64 { parts.get(idx).and_then(|s| s.parse().ok()).unwrap_or(0) };
+
+    Some((
+      name,
+      DiskStats {
+        sectors_read: parse_u64(5),
+        sectors_written: parse_u64(9),
+      },
+    ))
+  }
+
+  fn read_bytes_delta(prev: DiskStats, curr: DiskStats) -> u64 {
+    curr
+      .sectors_read
+      .saturating_sub(prev.sectors_read)
+      .saturating_mul(512)
+  }
+
+  fn write_bytes_delta(prev: DiskStats, curr: DiskStats) -> u64 {
+    curr
+      .sectors_written
+      .saturating_sub(prev.sectors_written)
+      .saturating_mul(512)
+  }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct NetStats {
+  rx_bytes: u64,
+  tx_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl NetStats {
+  fn parse_from_line(line: &str) -> Option<(String, NetStats)> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 10 {
+      return None;
+    }
+
+    let iface_with_colon = parts.first()?;
+    if !iface_with_colon.contains(':') {
+      return None;
+    }
+
+    let name = iface_with_colon.trim_end_matches(':').to_string();
+    if name == "lo" {
+      return None;
+    }
+
+    let parse_u64 =
+      |idx: usize| -> u64 { parts.get(idx).and_then(|s| s.parse().ok()).unwrap_or(0) };
+
+    Some((
+      name,
+      NetStats {
+        rx_bytes: parse_u64(1),
+        tx_bytes: parse_u64(9),
+      },
+    ))
+  }
+
+  fn rx_delta(prev: NetStats, curr: NetStats) -> u64 {
+    curr.rx_bytes.saturating_sub(prev.rx_bytes)
+  }
+
+  fn tx_delta(prev: NetStats, curr: NetStats) -> u64 {
+    curr.tx_bytes.saturating_sub(prev.tx_bytes)
+  }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct PreviousStats {
+  cpu: Option<CpuStats>,
+  disks: HashMap<String, DiskStats>,
+  networks: HashMap<String, NetStats>,
+  timestamp_ms: u64,
 }
 
 #[cfg(target_os = "linux")]
 pub struct LinuxProvider {
   manifest: ProviderManifest,
   sensors: Vec<SensorDescriptor>,
-  /// Previous CPU stats for utilization delta calculation.
-  /// Uses Arc<Mutex> for interior mutability since poll() takes &self.
-  prev_cpu_stats: Arc<Mutex<Option<CpuStats>>>,
+  prev_stats: Arc<Mutex<PreviousStats>>,
+  poll_interval: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for LinuxProvider {
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxProvider {
-  #[allow(clippy::new_without_default)]
   pub fn new() -> Self {
+    Self::with_poll_interval(Duration::from_millis(1000))
+  }
+
+  pub fn with_poll_interval(poll_interval: Duration) -> Self {
     tracing::info!("Initializing Linux provider");
-    let sensors = Self::discover_sensors();
+    let sensors = Self::discover_sensors_sync();
     tracing::info!("Linux provider discovered {} sensors", sensors.len());
     Self {
       manifest: linux_manifest(),
       sensors,
-      prev_cpu_stats: Arc::new(Mutex::new(None)),
+      prev_stats: Arc::new(Mutex::new(PreviousStats::default())),
+      poll_interval,
     }
   }
 
-  fn discover_sensors() -> Vec<SensorDescriptor> {
+  fn discover_sensors_sync() -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
 
-    match Self::discover_cpu_sensors() {
-      Ok(cpu_sensors) => {
-        tracing::debug!("Discovered {} CPU sensors", cpu_sensors.len());
-        sensors.extend(cpu_sensors);
-      }
-      Err(e) => {
-        tracing::warn!("Failed to discover CPU sensors: {}", e);
-      }
-    }
-
-    match Self::discover_memory_sensors() {
-      Ok(mem_sensors) => {
-        tracing::debug!("Discovered {} memory sensors", mem_sensors.len());
-        sensors.extend(mem_sensors);
-      }
-      Err(e) => {
-        tracing::warn!("Failed to discover memory sensors: {}", e);
-      }
-    }
-
-    match Self::discover_hwmon_sensors() {
-      Ok(hwmon_sensors) => {
-        tracing::debug!(
-          "Discovered {} hwmon temperature sensors",
-          hwmon_sensors.len()
-        );
-        sensors.extend(hwmon_sensors);
-      }
-      Err(e) => {
-        tracing::warn!("Failed to discover hwmon sensors: {}", e);
-      }
-    }
+    sensors.extend(Self::cpu_sensor_descriptors());
+    sensors.extend(Self::memory_sensor_descriptors());
+    sensors.extend(Self::swap_sensor_descriptors());
+    sensors.extend(Self::disk_sensor_descriptors());
+    sensors.extend(Self::network_sensor_descriptors());
+    sensors.extend(Self::hwmon_sensor_descriptors());
 
     sensors
   }
 
-  fn discover_cpu_sensors() -> std::io::Result<Vec<SensorDescriptor>> {
-    let _content = fs::read_to_string("/proc/cpuinfo")?;
+  fn cpu_sensor_descriptors() -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
-
     if let Ok(id) = SensorId::new("cpu.utilization") {
       sensors.push(SensorDescriptor {
         id,
@@ -156,91 +255,143 @@ impl LinuxProvider {
         tags: vec!["cpu".to_string()],
       });
     }
-
-    Ok(sensors)
+    sensors
   }
 
-  fn discover_memory_sensors() -> std::io::Result<Vec<SensorDescriptor>> {
-    let _content = fs::read_to_string("/proc/meminfo")?;
+  fn memory_sensor_descriptors() -> Vec<SensorDescriptor> {
+    let mut sensors = Vec::new();
+    for (suffix, name, unit) in [
+      ("used", "Memory Used", "bytes"),
+      ("total", "Memory Total", "bytes"),
+      ("utilization", "Memory Utilization", "percent"),
+      ("available", "Memory Available", "bytes"),
+    ] {
+      if let Ok(id) = SensorId::new(format!("memory.{}", suffix)) {
+        sensors.push(SensorDescriptor {
+          id,
+          name: name.to_string(),
+          category: "memory".to_string(),
+          unit: unit.to_string(),
+          device: None,
+          tags: vec!["memory".to_string()],
+        });
+      }
+    }
+    sensors
+  }
+
+  fn swap_sensor_descriptors() -> Vec<SensorDescriptor> {
+    let mut sensors = Vec::new();
+    for (suffix, name, unit) in [
+      ("used", "Swap Used", "bytes"),
+      ("total", "Swap Total", "bytes"),
+      ("utilization", "Swap Utilization", "percent"),
+      ("free", "Swap Free", "bytes"),
+    ] {
+      if let Ok(id) = SensorId::new(format!("swap.{}", suffix)) {
+        sensors.push(SensorDescriptor {
+          id,
+          name: name.to_string(),
+          category: "swap".to_string(),
+          unit: unit.to_string(),
+          device: None,
+          tags: vec!["swap".to_string()],
+        });
+      }
+    }
+    sensors
+  }
+
+  fn disk_sensor_descriptors() -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
 
-    if let Ok(id) = SensorId::new("memory.used") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "Memory Used".to_string(),
-        category: "memory".to_string(),
-        unit: "bytes".to_string(),
-        device: None,
-        tags: vec!["memory".to_string()],
-      });
+    if let Ok(content) = std::fs::read_to_string("/proc/diskstats") {
+      for line in content.lines() {
+        if let Some((name, _)) = DiskStats::parse_from_line(line) {
+          if name.starts_with("loop") || name.starts_with("ram") {
+            continue;
+          }
+
+          let safe_name = name.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+          for (suffix, display_name, unit) in [
+            ("read_bytes", "Read Bytes", "bytes"),
+            ("write_bytes", "Write Bytes", "bytes"),
+          ] {
+            if let Ok(id) = SensorId::new(format!("disk.{}.{}", safe_name, suffix)) {
+              sensors.push(SensorDescriptor {
+                id,
+                name: format!("{} {}", name, display_name),
+                category: "disk".to_string(),
+                unit: unit.to_string(),
+                device: Some(name.clone()),
+                tags: vec!["disk".to_string(), safe_name.clone()],
+              });
+            }
+          }
+        }
+      }
     }
 
-    if let Ok(id) = SensorId::new("memory.total") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "Memory Total".to_string(),
-        category: "memory".to_string(),
-        unit: "bytes".to_string(),
-        device: None,
-        tags: vec!["memory".to_string()],
-      });
-    }
-
-    if let Ok(id) = SensorId::new("memory.utilization") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "Memory Utilization".to_string(),
-        category: "memory".to_string(),
-        unit: "percent".to_string(),
-        device: None,
-        tags: vec!["memory".to_string()],
-      });
-    }
-
-    if let Ok(id) = SensorId::new("memory.available") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "Memory Available".to_string(),
-        category: "memory".to_string(),
-        unit: "bytes".to_string(),
-        device: None,
-        tags: vec!["memory".to_string()],
-      });
-    }
-
-    Ok(sensors)
+    sensors
   }
 
-  fn discover_hwmon_sensors() -> std::io::Result<Vec<SensorDescriptor>> {
+  fn network_sensor_descriptors() -> Vec<SensorDescriptor> {
+    let mut sensors = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string("/proc/net/dev") {
+      for line in content.lines().skip(2) {
+        if let Some((name, _)) = NetStats::parse_from_line(line) {
+          let safe_name = name.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+          for (suffix, display_name, unit) in [
+            ("rx_bytes", "RX Bytes", "bytes"),
+            ("tx_bytes", "TX Bytes", "bytes"),
+          ] {
+            if let Ok(id) = SensorId::new(format!("network.{}.{}", safe_name, suffix)) {
+              sensors.push(SensorDescriptor {
+                id,
+                name: format!("{} {}", name, display_name),
+                category: "network".to_string(),
+                unit: unit.to_string(),
+                device: Some(name.clone()),
+                tags: vec!["network".to_string(), safe_name.clone()],
+              });
+            }
+          }
+        }
+      }
+    }
+
+    sensors
+  }
+
+  fn hwmon_sensor_descriptors() -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
     let hwmon_path = Path::new("/sys/class/hwmon");
 
     if !hwmon_path.exists() {
-      tracing::debug!("hwmon path does not exist: {}", hwmon_path.display());
-      return Ok(sensors);
+      return sensors;
     }
 
-    let entries = fs::read_dir(hwmon_path)?;
-    for entry in entries {
-      let entry = entry?;
-      let hwmon_dir = entry.path();
+    if let Ok(entries) = std::fs::read_dir(hwmon_path) {
+      for entry in entries.flatten() {
+        let hwmon_dir = entry.path();
 
-      let name = fs::read_to_string(hwmon_dir.join("name"))
-        .unwrap_or_else(|_| "unknown".to_string())
-        .trim()
-        .to_lowercase();
+        let name = std::fs::read_to_string(hwmon_dir.join("name"))
+          .unwrap_or_else(|_| "unknown".to_string())
+          .trim()
+          .to_lowercase();
 
-      let temp_sensors = Self::find_temp_sensors(&hwmon_dir, &name);
-      sensors.extend(temp_sensors);
+        sensors.extend(Self::find_temp_sensor_descriptors(&hwmon_dir, &name));
+      }
     }
 
-    Ok(sensors)
+    sensors
   }
 
-  fn find_temp_sensors(hwmon_dir: &Path, device_name: &str) -> Vec<SensorDescriptor> {
+  fn find_temp_sensor_descriptors(hwmon_dir: &Path, device_name: &str) -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(hwmon_dir) {
+    if let Ok(entries) = std::fs::read_dir(hwmon_dir) {
       for entry in entries.flatten() {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
@@ -259,7 +410,7 @@ impl LinuxProvider {
           continue;
         }
 
-        let label = fs::read_to_string(hwmon_dir.join(format!("temp{}_label", index)))
+        let label = std::fs::read_to_string(hwmon_dir.join(format!("temp{}_label", index)))
           .ok()
           .map(|s| s.trim().to_string());
 
@@ -301,7 +452,6 @@ impl LinuxProvider {
     }
   }
 
-  /// Get current timestamp in milliseconds since UNIX epoch.
   fn current_timestamp_ms() -> u64 {
     SystemTime::now()
       .duration_since(UNIX_EPOCH)
@@ -309,39 +459,57 @@ impl LinuxProvider {
       .unwrap_or(0)
   }
 
-  /// Parse /proc/stat first line (aggregate CPU stats).
-  /// Format: cpu  user nice system idle iowait irq softirq steal guest guest_nice
-  fn read_cpu_stats() -> Option<CpuStats> {
-    let content = fs::read_to_string("/proc/stat").ok()?;
+  async fn read_cpu_stats() -> Option<CpuStats> {
+    let content = tokio::fs::read_to_string("/proc/stat").await.ok()?;
     let first_line = content.lines().next()?;
-
-    // Skip "cpu" prefix and parse values
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 8 || parts[0] != "cpu" {
-      return None;
-    }
-
-    let parse_u64 =
-      |idx: usize| -> u64 { parts.get(idx).and_then(|s| s.parse().ok()).unwrap_or(0) };
-
-    Some(CpuStats {
-      user: parse_u64(1),
-      nice: parse_u64(2),
-      system: parse_u64(3),
-      idle: parse_u64(4),
-      iowait: parse_u64(5),
-      irq: parse_u64(6),
-      softirq: parse_u64(7),
-      steal: parse_u64(8),
-      guest: parse_u64(9),
-      guest_nice: parse_u64(10),
-    })
+    CpuStats::parse_from_line(first_line)
   }
 
-  /// Poll CPU utilization sensor.
-  /// Requires previous stats for delta calculation.
-  fn poll_cpu(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
-    let current_stats = match Self::read_cpu_stats() {
+  async fn read_meminfo() -> Option<HashMap<String, u64>> {
+    let content = tokio::fs::read_to_string("/proc/meminfo").await.ok()?;
+    let mut meminfo = HashMap::new();
+
+    for line in content.lines() {
+      let parts: Vec<&str> = line.split_whitespace().collect();
+      if parts.len() >= 2 {
+        let key = parts[0].trim_end_matches(':');
+        if let Ok(kb) = parts[1].parse::<u64>() {
+          meminfo.insert(key.to_string(), kb * 1024);
+        }
+      }
+    }
+
+    Some(meminfo)
+  }
+
+  async fn read_diskstats() -> Option<HashMap<String, DiskStats>> {
+    let content = tokio::fs::read_to_string("/proc/diskstats").await.ok()?;
+    let mut stats = HashMap::new();
+
+    for line in content.lines() {
+      if let Some((name, ds)) = DiskStats::parse_from_line(line) {
+        stats.insert(name, ds);
+      }
+    }
+
+    Some(stats)
+  }
+
+  async fn read_net_dev() -> Option<HashMap<String, NetStats>> {
+    let content = tokio::fs::read_to_string("/proc/net/dev").await.ok()?;
+    let mut stats = HashMap::new();
+
+    for line in content.lines().skip(2) {
+      if let Some((name, ns)) = NetStats::parse_from_line(line) {
+        stats.insert(name, ns);
+      }
+    }
+
+    Some(stats)
+  }
+
+  async fn poll_cpu(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+    let current_stats = match Self::read_cpu_stats().await {
       Some(stats) => stats,
       None => {
         tracing::warn!("Failed to read /proc/stat for CPU utilization");
@@ -349,10 +517,9 @@ impl LinuxProvider {
       }
     };
 
-    // Calculate utilization if we have previous stats
-    let mut prev_guard = self.prev_cpu_stats.lock().unwrap();
-    if let Some(prev_stats) = prev_guard.as_ref() {
-      if let Some(utilization) = CpuStats::utilization_from(*prev_stats, current_stats) {
+    let mut prev_guard = self.prev_stats.lock().unwrap();
+    if let Some(prev_stats) = prev_guard.cpu {
+      if let Some(utilization) = CpuStats::utilization_from(prev_stats, current_stats) {
         if let Ok(id) = SensorId::new("cpu.utilization") {
           samples.push(SensorSample {
             sensor_id: id,
@@ -363,33 +530,11 @@ impl LinuxProvider {
       }
     }
 
-    // Store current stats for next poll
-    *prev_guard = Some(current_stats);
+    prev_guard.cpu = Some(current_stats);
   }
 
-  /// Parse /proc/meminfo and return key-value pairs in kB.
-  fn read_meminfo() -> Option<HashMap<String, u64>> {
-    let content = fs::read_to_string("/proc/meminfo").ok()?;
-    let mut meminfo = HashMap::new();
-
-    for line in content.lines() {
-      let parts: Vec<&str> = line.split_whitespace().collect();
-      if parts.len() >= 2 {
-        // Remove trailing colon from key (e.g., "MemTotal:")
-        let key = parts[0].trim_end_matches(':');
-        // Value is in kB, convert to bytes
-        if let Ok(kb) = parts[1].parse::<u64>() {
-          meminfo.insert(key.to_string(), kb * 1024);
-        }
-      }
-    }
-
-    Some(meminfo)
-  }
-
-  /// Poll memory sensors from /proc/meminfo.
-  fn poll_memory(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
-    let meminfo = match Self::read_meminfo() {
+  async fn poll_memory(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+    let meminfo = match Self::read_meminfo().await {
       Some(info) => info,
       None => {
         tracing::warn!("Failed to read /proc/meminfo");
@@ -399,21 +544,13 @@ impl LinuxProvider {
 
     let mem_total = meminfo.get("MemTotal").copied().unwrap_or(0);
     let mem_available = meminfo.get("MemAvailable").copied().unwrap_or(0);
-    let mem_free = meminfo.get("MemFree").copied().unwrap_or(0);
-    let buffers = meminfo.get("Buffers").copied().unwrap_or(0);
-    let cached = meminfo.get("Cached").copied().unwrap_or(0);
-
-    // Used memory = Total - Available (more accurate than Total - Free)
     let mem_used = mem_total.saturating_sub(mem_available);
-
-    // Memory utilization percentage
     let mem_utilization = if mem_total > 0 {
       Some((mem_used as f64 / mem_total as f64) * 100.0)
     } else {
       None
     };
 
-    // Push samples
     if let Ok(id) = SensorId::new("memory.total") {
       samples.push(SensorSample {
         sensor_id: id,
@@ -421,7 +558,6 @@ impl LinuxProvider {
         value: Some(mem_total as f64),
       });
     }
-
     if let Ok(id) = SensorId::new("memory.used") {
       samples.push(SensorSample {
         sensor_id: id,
@@ -429,7 +565,6 @@ impl LinuxProvider {
         value: Some(mem_used as f64),
       });
     }
-
     if let Ok(id) = SensorId::new("memory.available") {
       samples.push(SensorSample {
         sensor_id: id,
@@ -437,7 +572,6 @@ impl LinuxProvider {
         value: Some(mem_available as f64),
       });
     }
-
     if let Ok(id) = SensorId::new("memory.utilization") {
       samples.push(SensorSample {
         sensor_id: id,
@@ -445,29 +579,141 @@ impl LinuxProvider {
         value: mem_utilization,
       });
     }
-
-    // Log additional info for debugging
-    tracing::trace!(
-      "Memory: total={}MB, used={}MB, available={}MB, free={}MB, buffers={}MB, cached={}MB",
-      mem_total / 1024 / 1024,
-      mem_used / 1024 / 1024,
-      mem_available / 1024 / 1024,
-      mem_free / 1024 / 1024,
-      buffers / 1024 / 1024,
-      cached / 1024 / 1024
-    );
   }
 
-  /// Poll temperature sensors from /sys/class/hwmon.
-  fn poll_temperatures(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+  async fn poll_swap(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+    let meminfo = match Self::read_meminfo().await {
+      Some(info) => info,
+      None => return,
+    };
+
+    let swap_total = meminfo.get("SwapTotal").copied().unwrap_or(0);
+    let swap_free = meminfo.get("SwapFree").copied().unwrap_or(0);
+    let swap_used = swap_total.saturating_sub(swap_free);
+    let swap_utilization = if swap_total > 0 {
+      Some((swap_used as f64 / swap_total as f64) * 100.0)
+    } else {
+      None
+    };
+
+    if let Ok(id) = SensorId::new("swap.total") {
+      samples.push(SensorSample {
+        sensor_id: id,
+        timestamp_ms,
+        value: Some(swap_total as f64),
+      });
+    }
+    if let Ok(id) = SensorId::new("swap.used") {
+      samples.push(SensorSample {
+        sensor_id: id,
+        timestamp_ms,
+        value: Some(swap_used as f64),
+      });
+    }
+    if let Ok(id) = SensorId::new("swap.free") {
+      samples.push(SensorSample {
+        sensor_id: id,
+        timestamp_ms,
+        value: Some(swap_free as f64),
+      });
+    }
+    if let Ok(id) = SensorId::new("swap.utilization") {
+      samples.push(SensorSample {
+        sensor_id: id,
+        timestamp_ms,
+        value: swap_utilization,
+      });
+    }
+  }
+
+  async fn poll_disk(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+    let current_stats = match Self::read_diskstats().await {
+      Some(stats) => stats,
+      None => {
+        tracing::trace!("Failed to read /proc/diskstats");
+        return;
+      }
+    };
+
+    let mut prev_guard = self.prev_stats.lock().unwrap();
+
+    for (name, curr) in &current_stats {
+      if name.starts_with("loop") || name.starts_with("ram") {
+        continue;
+      }
+
+      let safe_name = name.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+
+      if let Some(prev) = prev_guard.disks.get(name) {
+        let read_delta = DiskStats::read_bytes_delta(*prev, *curr);
+        let write_delta = DiskStats::write_bytes_delta(*prev, *curr);
+
+        if let Ok(id) = SensorId::new(format!("disk.{}.read_bytes", safe_name)) {
+          samples.push(SensorSample {
+            sensor_id: id,
+            timestamp_ms,
+            value: Some(read_delta as f64),
+          });
+        }
+        if let Ok(id) = SensorId::new(format!("disk.{}.write_bytes", safe_name)) {
+          samples.push(SensorSample {
+            sensor_id: id,
+            timestamp_ms,
+            value: Some(write_delta as f64),
+          });
+        }
+      }
+    }
+
+    prev_guard.disks = current_stats;
+  }
+
+  async fn poll_network(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+    let current_stats = match Self::read_net_dev().await {
+      Some(stats) => stats,
+      None => {
+        tracing::trace!("Failed to read /proc/net/dev");
+        return;
+      }
+    };
+
+    let mut prev_guard = self.prev_stats.lock().unwrap();
+
+    for (name, curr) in &current_stats {
+      let safe_name = name.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+
+      if let Some(prev) = prev_guard.networks.get(name) {
+        let rx_delta = NetStats::rx_delta(*prev, *curr);
+        let tx_delta = NetStats::tx_delta(*prev, *curr);
+
+        if let Ok(id) = SensorId::new(format!("network.{}.rx_bytes", safe_name)) {
+          samples.push(SensorSample {
+            sensor_id: id,
+            timestamp_ms,
+            value: Some(rx_delta as f64),
+          });
+        }
+        if let Ok(id) = SensorId::new(format!("network.{}.tx_bytes", safe_name)) {
+          samples.push(SensorSample {
+            sensor_id: id,
+            timestamp_ms,
+            value: Some(tx_delta as f64),
+          });
+        }
+      }
+    }
+
+    prev_guard.networks = current_stats;
+  }
+
+  async fn poll_temperatures(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
     let hwmon_path = Path::new("/sys/class/hwmon");
 
     if !hwmon_path.exists() {
-      tracing::trace!("hwmon path does not exist");
       return;
     }
 
-    let entries = match fs::read_dir(hwmon_path) {
+    let entries = match tokio::fs::read_dir(hwmon_path).await {
       Ok(e) => e,
       Err(e) => {
         tracing::warn!("Failed to read hwmon directory: {}", e);
@@ -475,17 +721,17 @@ impl LinuxProvider {
       }
     };
 
-    for entry in entries.flatten() {
+    let mut entries = entries;
+    while let Ok(Some(entry)) = entries.next_entry().await {
       let hwmon_dir = entry.path();
 
-      let device_name = match fs::read_to_string(hwmon_dir.join("name")) {
+      let device_name = match tokio::fs::read_to_string(hwmon_dir.join("name")).await {
         Ok(name) => name.trim().to_lowercase(),
         Err(_) => continue,
       };
 
-      // Find and read temperature input files
-      if let Ok(dir_entries) = fs::read_dir(&hwmon_dir) {
-        for file_entry in dir_entries.flatten() {
+      if let Ok(mut dir_entries) = tokio::fs::read_dir(&hwmon_dir).await {
+        while let Ok(Some(file_entry)) = dir_entries.next_entry().await {
           let file_name = file_entry.file_name();
           let name = file_name.to_string_lossy();
 
@@ -503,13 +749,9 @@ impl LinuxProvider {
             continue;
           }
 
-          // Read temperature value (in millidegrees Celsius)
-          let temp_content = match fs::read_to_string(file_entry.path()) {
+          let temp_content = match tokio::fs::read_to_string(file_entry.path()).await {
             Ok(c) => c,
-            Err(e) => {
-              tracing::trace!("Failed to read {}: {}", file_entry.path().display(), e);
-              continue;
-            }
+            Err(_) => continue,
           };
 
           let temp_mc: i64 = match temp_content.trim().parse() {
@@ -517,7 +759,6 @@ impl LinuxProvider {
             Err(_) => continue,
           };
 
-          // Convert millidegrees to Celsius
           let temp_c = temp_mc as f64 / 1000.0;
 
           let sensor_id_str = Self::make_temp_sensor_id(&device_name, &index);
@@ -556,6 +797,9 @@ fn linux_manifest() -> ProviderManifest {
       categories: vec![
         "cpu".to_string(),
         "memory".to_string(),
+        "swap".to_string(),
+        "disk".to_string(),
+        "network".to_string(),
         "temperature".to_string(),
       ],
     },
@@ -569,8 +813,8 @@ impl Provider for LinuxProvider {
     &self.manifest
   }
 
-  fn poll_interval(&self) -> std::time::Duration {
-    std::time::Duration::from_millis(1000)
+  fn poll_interval(&self) -> Duration {
+    self.poll_interval
   }
 
   async fn discover(&self) -> ProviderResult<Vec<SensorDescriptor>> {
@@ -581,17 +825,39 @@ impl Provider for LinuxProvider {
     let mut samples = Vec::new();
     let timestamp_ms = Self::current_timestamp_ms();
 
-    // Poll each sensor category
-    self.poll_cpu(&mut samples, timestamp_ms);
-    self.poll_memory(&mut samples, timestamp_ms);
-    self.poll_temperatures(&mut samples, timestamp_ms);
+    self.poll_cpu(&mut samples, timestamp_ms).await;
+    self.poll_memory(&mut samples, timestamp_ms).await;
+    self.poll_swap(&mut samples, timestamp_ms).await;
+    self.poll_disk(&mut samples, timestamp_ms).await;
+    self.poll_network(&mut samples, timestamp_ms).await;
+    self.poll_temperatures(&mut samples, timestamp_ms).await;
+
+    {
+      let mut prev = self.prev_stats.lock().unwrap();
+      prev.timestamp_ms = timestamp_ms;
+    }
 
     tracing::trace!("Linux provider polled {} samples", samples.len());
     Ok(samples)
   }
 
   async fn health(&self) -> ProviderHealth {
-    ProviderHealth::Ok
+    let mut failures = Vec::new();
+
+    if tokio::fs::read_to_string("/proc/stat").await.is_err() {
+      failures.push("/proc/stat unreadable");
+    }
+    if tokio::fs::read_to_string("/proc/meminfo").await.is_err() {
+      failures.push("/proc/meminfo unreadable");
+    }
+
+    if failures.is_empty() {
+      ProviderHealth::Ok
+    } else {
+      ProviderHealth::Degraded {
+        message: failures.join(", "),
+      }
+    }
   }
 
   async fn shutdown(&self) -> ProviderResult<()> {
@@ -627,22 +893,18 @@ mod tests {
     };
 
     let curr = CpuStats {
-      user: 150, // +50
+      user: 150,
       nice: 0,
-      system: 75, // +25
-      idle: 900,  // +90
-      iowait: 15, // +5
-      irq: 7,     // +2
-      softirq: 6, // +1
+      system: 75,
+      idle: 900,
+      iowait: 15,
+      irq: 7,
+      softirq: 6,
       steal: 0,
       guest: 0,
       guest_nice: 0,
     };
 
-    // Total delta = 50 + 0 + 25 + 100 + 5 + 2 + 1 = 183
-    // Idle delta = 100 + 5 = 105
-    // Active delta = 183 - 105 = 78
-    // Utilization = 78 / 183 * 100 = 42.62%
     let utilization = CpuStats::utilization_from(prev, curr);
     assert!(utilization.is_some());
 
@@ -665,7 +927,6 @@ mod tests {
       guest_nice: 0,
     };
 
-    // Same stats should return None (no change)
     let utilization = CpuStats::utilization_from(stats, stats);
     assert!(utilization.is_none());
   }
@@ -678,10 +939,9 @@ mod tests {
       ..CpuStats::default()
     };
 
-    // Edge case: all active, no idle
     let curr = CpuStats {
-      user: 200, // +100 active
-      idle: 100, // 0 idle
+      user: 200,
+      idle: 100,
       ..CpuStats::default()
     };
 
@@ -691,9 +951,127 @@ mod tests {
   }
 
   #[test]
+  fn test_cpu_stats_parse_valid() {
+    let line = "cpu  100 0 50 800 10 5 5 0 0 0";
+    let stats = CpuStats::parse_from_line(line).unwrap();
+    assert_eq!(stats.user, 100);
+    assert_eq!(stats.system, 50);
+    assert_eq!(stats.idle, 800);
+  }
+
+  #[test]
+  fn test_cpu_stats_parse_invalid_prefix() {
+    let line = "cpu0 100 0 50 800 10 5 5 0 0 0";
+    assert!(CpuStats::parse_from_line(line).is_none());
+  }
+
+  #[test]
+  fn test_disk_stats_parse() {
+    let line = "  8       0 sda 100 50 2000 100 200 100 4000 200";
+    let (name, stats) = DiskStats::parse_from_line(line).unwrap();
+    assert_eq!(name, "sda");
+    assert_eq!(stats.sectors_read, 2000);
+    assert_eq!(stats.sectors_written, 4000);
+  }
+
+  #[test]
+  fn test_disk_stats_delta() {
+    let prev = DiskStats {
+      sectors_read: 2000,
+      sectors_written: 4000,
+      ..DiskStats::default()
+    };
+    let curr = DiskStats {
+      sectors_read: 3000,
+      sectors_written: 6000,
+      ..DiskStats::default()
+    };
+    assert_eq!(DiskStats::read_bytes_delta(prev, curr), 1000 * 512);
+    assert_eq!(DiskStats::write_bytes_delta(prev, curr), 2000 * 512);
+  }
+
+  #[test]
+  fn test_net_stats_parse() {
+    let line = "  eth0: 1000    0    0    0    0     0          0        0 2000    0    0    0    0     0          0        0";
+    let (name, stats) = NetStats::parse_from_line(line).unwrap();
+    assert_eq!(name, "eth0");
+    assert_eq!(stats.rx_bytes, 1000);
+    assert_eq!(stats.tx_bytes, 2000);
+  }
+
+  #[test]
+  fn test_net_stats_skip_loopback() {
+    let line = "  lo: 100    0    0    0    0     0          0        0 100    0    0    0    0     0          0        0";
+    assert!(NetStats::parse_from_line(line).is_none());
+  }
+
+  #[test]
+  fn test_net_stats_delta() {
+    let prev = NetStats {
+      rx_bytes: 1000,
+      tx_bytes: 2000,
+    };
+    let curr = NetStats {
+      rx_bytes: 3000,
+      tx_bytes: 5000,
+    };
+    assert_eq!(NetStats::rx_delta(prev, curr), 2000);
+    assert_eq!(NetStats::tx_delta(prev, curr), 3000);
+  }
+
+  #[test]
   fn test_current_timestamp_ms() {
     let ts = LinuxProvider::current_timestamp_ms();
-    // Should be a reasonable timestamp (after year 2020)
-    assert!(ts > 1577836800000); // Jan 1, 2020 in ms
+    assert!(ts > 1577836800000);
+  }
+
+  #[test]
+  fn test_sensor_descriptors_valid_ids() {
+    let sensors = LinuxProvider::discover_sensors_sync();
+    for sensor in &sensors {
+      assert!(
+        !sensor.name.is_empty(),
+        "Sensor {} missing name",
+        sensor.id.as_str()
+      );
+      assert!(
+        !sensor.category.is_empty(),
+        "Sensor {} missing category",
+        sensor.id.as_str()
+      );
+      assert!(
+        !sensor.unit.is_empty(),
+        "Sensor {} missing unit",
+        sensor.id.as_str()
+      );
+    }
+  }
+
+  #[test]
+  fn test_make_temp_sensor_id_cpu() {
+    assert_eq!(
+      LinuxProvider::make_temp_sensor_id("coretemp", "1"),
+      "cpu.coretemp.temp1.temperature"
+    );
+    assert_eq!(
+      LinuxProvider::make_temp_sensor_id("k10temp", "2"),
+      "cpu.k10temp.temp2.temperature"
+    );
+  }
+
+  #[test]
+  fn test_make_temp_sensor_id_gpu() {
+    assert_eq!(
+      LinuxProvider::make_temp_sensor_id("nvidia", "1"),
+      "gpu.nvidia.temp1.temperature"
+    );
+  }
+
+  #[test]
+  fn test_make_temp_sensor_id_other() {
+    assert_eq!(
+      LinuxProvider::make_temp_sensor_id("acpitz", "1"),
+      "acpitz.temp1.temperature"
+    );
   }
 }
