@@ -18,22 +18,20 @@ pub struct ProviderEntry {
   task: Option<JoinHandle<()>>,
   health: Arc<RwLock<ProviderHealth>>,
   sensor_ids: Arc<RwLock<HashSet<String>>>,
+  cancel_token: CancellationToken,
 }
 
 pub struct ProviderHost {
   providers: HashMap<String, ProviderEntry>,
   store: Arc<SensorStore>,
-  shutdown_token: CancellationToken,
   config: HostConfig,
 }
 
 impl ProviderHost {
   pub fn new(config: HostConfig, store: Arc<SensorStore>) -> Self {
-    let shutdown_token = CancellationToken::new();
     Self {
       providers: HashMap::new(),
       store,
-      shutdown_token,
       config,
     }
   }
@@ -41,6 +39,12 @@ impl ProviderHost {
   pub fn register_provider(&mut self, provider: Arc<Box<dyn Provider>>) -> ProviderResult<()> {
     let manifest = provider.as_ref().manifest();
     let id = manifest.id.clone();
+
+    if let Err(e) = manifest.validate() {
+      return Err(ProviderError::InvalidManifest {
+        reason: format!("Provider '{}': {}", id, e),
+      });
+    }
 
     if self.providers.contains_key(&id) {
       return Err(ProviderError::RegistrationFailed {
@@ -56,6 +60,7 @@ impl ProviderHost {
         task: None,
         health: Arc::new(RwLock::new(ProviderHealth::Ok)),
         sensor_ids: Arc::new(RwLock::new(HashSet::new())),
+        cancel_token: CancellationToken::new(),
       },
     );
 
@@ -75,6 +80,7 @@ impl ProviderHost {
           Arc::clone(&entry.provider),
           Arc::clone(&entry.health),
           Arc::clone(&entry.sensor_ids),
+          entry.cancel_token.clone(),
         );
         (id.clone(), task)
       })
@@ -94,7 +100,9 @@ impl ProviderHost {
     let provider_count = self.providers.len();
     tracing::info!("Initiating shutdown of {} providers", provider_count);
 
-    self.shutdown_token.cancel();
+    for entry in self.providers.values() {
+      entry.cancel_token.cancel();
+    }
 
     let timeout_duration = tokio::time::Duration::from_millis(self.config.shutdown_timeout_ms);
 
@@ -183,9 +191,9 @@ impl ProviderHost {
     provider: Arc<Box<dyn Provider>>,
     health: Arc<RwLock<ProviderHealth>>,
     sensor_ids: Arc<RwLock<HashSet<String>>>,
+    cancel_token: CancellationToken,
   ) -> JoinHandle<()> {
     let store = Arc::clone(&self.store);
-    let token = self.shutdown_token.clone();
     let provider_interval = provider.as_ref().poll_interval();
     let min_interval = std::time::Duration::from_millis(self.config.min_poll_interval_ms);
     let poll_interval = provider_interval.max(min_interval);
@@ -232,7 +240,7 @@ impl ProviderHost {
               }
             }
           }
-          _ = token.cancelled() => {
+          _ = cancel_token.cancelled() => {
             tracing::info!("Provider {} shutdown requested", id);
             break;
           }
@@ -384,6 +392,52 @@ impl ProviderHost {
         Self::handle_panic(provider_id, health, panic_payload);
       }
     }
+  }
+
+  pub async fn unregister_provider(&mut self, id: &str) -> ProviderResult<()> {
+    let entry = self
+      .providers
+      .remove(id)
+      .ok_or_else(|| ProviderError::RegistrationFailed {
+        id: id.to_string(),
+        reason: format!("Provider '{}' not found", id),
+      })?;
+
+    entry.cancel_token.cancel();
+
+    if let Some(task) = entry.task {
+      let timeout_duration =
+        tokio::time::Duration::from_millis(self.config.shutdown_timeout_ms);
+      match tokio::time::timeout(timeout_duration, task).await {
+        Ok(Ok(())) | Ok(Err(_)) => {}
+        Err(_) => {
+          tracing::warn!("Provider {} did not complete within timeout during unregister", id);
+        }
+      }
+    }
+
+    tracing::info!("Provider {} unregistered", id);
+    Ok(())
+  }
+
+  pub fn get_provider_health(&self, id: &str) -> Option<ProviderHealth> {
+    self.providers.get(id).map(|entry| {
+      entry
+        .health
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or(ProviderHealth::Error {
+          message: "Lock poisoned".to_string(),
+        })
+    })
+  }
+
+  pub fn is_provider_running(&self, id: &str) -> bool {
+    self
+      .providers
+      .get(id)
+      .map(|entry| entry.task.is_some())
+      .unwrap_or(false)
   }
 
   pub fn get_providers_status(&self) -> Vec<ProviderStatus> {
@@ -581,7 +635,6 @@ mod tests {
   }
 
   #[tokio::test]
-  #[ignore = "requires panic containment test infrastructure"]
   async fn panic_containment_discover_updates_health() {
     let store = Arc::new(SensorStore::new());
     let config = HostConfig::default();
@@ -601,7 +654,6 @@ mod tests {
   }
 
   #[tokio::test]
-  #[ignore = "requires panic containment test infrastructure"]
   async fn panic_containment_poll_updates_health() {
     let store = Arc::new(SensorStore::new());
     let config = HostConfig::default();
@@ -622,7 +674,6 @@ mod tests {
   }
 
   #[tokio::test]
-  #[ignore = "requires panic containment test infrastructure"]
   async fn panic_containment_other_providers_continue() {
     let store = Arc::new(SensorStore::new());
     let config = HostConfig::default();
