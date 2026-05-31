@@ -15,12 +15,15 @@ use astragauge_domain::{
 use astragauge_provider_host::{Provider, ProviderHealth, ProviderResult};
 
 /// Parameters for a time-varying demo sensor: descriptor plus the
-/// (base, amplitude, period_ms) used to compute a sine-based value.
+/// (base, amplitude, period_ms) used to compute a sine-based value, clamped
+/// to the sensor's plausible [clamp_min, clamp_max] range.
 struct DemoSensor {
   descriptor: SensorDescriptor,
   base: f64,
   amplitude: f64,
   period_ms: u64,
+  clamp_min: f64,
+  clamp_max: f64,
 }
 
 /// A mock provider for testing that returns configurable sensor data.
@@ -78,65 +81,99 @@ impl MockProvider {
     }
   }
 
-  /// Creates a MockProvider with four time-varying demo sensors so the UI
-  /// visibly updates. Each sensor's value follows a sine wave:
-  /// `value = clamp(base + amplitude * sin(2*pi*(now_ms % period_ms) / period_ms), 0, 100)`.
+  /// Creates a MockProvider with a full set of time-varying demo sensors so
+  /// the default panel reads like a real system instrument cluster. Each
+  /// sensor's value follows a sine wave:
+  /// `value = clamp(base + amplitude * sin(2*pi*(now_ms % period_ms) / period_ms), clamp_min, clamp_max)`.
   ///
   /// Poll interval is 500ms.
   pub fn new_demo() -> Self {
+    // (base, amplitude, period_ms) describe the sine wave; (min, max) clamp it.
+    fn demo(
+      id: &str,
+      name: &str,
+      category: &str,
+      unit: &str,
+      wave: (f64, f64, u64),
+      clamp: (f64, f64),
+    ) -> DemoSensor {
+      DemoSensor {
+        descriptor: SensorDescriptor {
+          id: SensorId::new(id).expect("valid sensor id"),
+          name: name.to_string(),
+          category: category.to_string(),
+          unit: unit.to_string(),
+          device: None,
+          tags: vec![],
+        },
+        base: wave.0,
+        amplitude: wave.1,
+        period_ms: wave.2,
+        clamp_min: clamp.0,
+        clamp_max: clamp.1,
+      }
+    }
+
     let demo_sensors = vec![
-      DemoSensor {
-        descriptor: SensorDescriptor {
-          id: SensorId::new("cpu.total.utilization").expect("valid sensor id"),
-          name: "CPU Utilization".to_string(),
-          category: "utilization".to_string(),
-          unit: "percent".to_string(),
-          device: None,
-          tags: vec![],
-        },
-        base: 45.0,
-        amplitude: 35.0,
-        period_ms: 7000,
-      },
-      DemoSensor {
-        descriptor: SensorDescriptor {
-          id: SensorId::new("cpu.temperature").expect("valid sensor id"),
-          name: "CPU Temperature".to_string(),
-          category: "temperature".to_string(),
-          unit: "celsius".to_string(),
-          device: None,
-          tags: vec![],
-        },
-        base: 55.0,
-        amplitude: 18.0,
-        period_ms: 11000,
-      },
-      DemoSensor {
-        descriptor: SensorDescriptor {
-          id: SensorId::new("memory.used.percent").expect("valid sensor id"),
-          name: "Memory Used".to_string(),
-          category: "utilization".to_string(),
-          unit: "percent".to_string(),
-          device: None,
-          tags: vec![],
-        },
-        base: 60.0,
-        amplitude: 20.0,
-        period_ms: 17000,
-      },
-      DemoSensor {
-        descriptor: SensorDescriptor {
-          id: SensorId::new("gpu.temperature").expect("valid sensor id"),
-          name: "GPU Temperature".to_string(),
-          category: "temperature".to_string(),
-          unit: "celsius".to_string(),
-          device: None,
-          tags: vec![],
-        },
-        base: 50.0,
-        amplitude: 22.0,
-        period_ms: 13000,
-      },
+      // CPU
+      demo(
+        "cpu.total.utilization",
+        "CPU Utilization",
+        "utilization",
+        "%",
+        (45.0, 38.0, 7000),
+        (0.0, 100.0),
+      ),
+      demo(
+        "cpu.clock",
+        "CPU Clock",
+        "frequency",
+        "MHz",
+        (4100.0, 700.0, 6500),
+        (800.0, 5200.0),
+      ),
+      demo(
+        "cpu.temperature",
+        "CPU Temperature",
+        "temperature",
+        "°C",
+        (55.0, 18.0, 11000),
+        (20.0, 95.0),
+      ),
+      // GPU
+      demo(
+        "gpu.total.utilization",
+        "GPU Utilization",
+        "utilization",
+        "%",
+        (40.0, 40.0, 9000),
+        (0.0, 100.0),
+      ),
+      demo(
+        "gpu.temperature",
+        "GPU Temperature",
+        "temperature",
+        "°C",
+        (50.0, 22.0, 13000),
+        (20.0, 95.0),
+      ),
+      // Memory
+      demo(
+        "memory.used.percent",
+        "Memory Used",
+        "utilization",
+        "%",
+        (60.0, 20.0, 17000),
+        (0.0, 100.0),
+      ),
+      demo(
+        "memory.used",
+        "Memory Used",
+        "memory",
+        "MB",
+        (19000.0, 4500.0, 17000),
+        (2048.0, 32768.0),
+      ),
     ];
 
     let descriptors = demo_sensors.iter().map(|s| s.descriptor.clone()).collect();
@@ -200,7 +237,8 @@ impl Provider for MockProvider {
         .iter()
         .map(|s| {
           let phase = (timestamp_ms % s.period_ms) as f64 / s.period_ms as f64;
-          let value = (s.base + s.amplitude * (2.0 * PI * phase).sin()).clamp(0.0, 100.0);
+          let value =
+            (s.base + s.amplitude * (2.0 * PI * phase).sin()).clamp(s.clamp_min, s.clamp_max);
           SensorSample {
             sensor_id: s.descriptor.id.clone(),
             timestamp_ms,
@@ -303,32 +341,39 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_new_demo_discovers_four_sensors() {
+  async fn test_new_demo_discovers_full_instrument_set() {
     let provider = MockProvider::new_demo();
     let descriptors = provider.discover().await.unwrap();
-    assert_eq!(descriptors.len(), 4);
+    assert_eq!(descriptors.len(), 7);
 
     let ids: Vec<&str> = descriptors.iter().map(|d| d.id.as_str()).collect();
-    assert!(ids.contains(&"cpu.total.utilization"));
-    assert!(ids.contains(&"cpu.temperature"));
-    assert!(ids.contains(&"memory.used.percent"));
-    assert!(ids.contains(&"gpu.temperature"));
+    for expected in [
+      "cpu.total.utilization",
+      "cpu.clock",
+      "cpu.temperature",
+      "gpu.total.utilization",
+      "gpu.temperature",
+      "memory.used.percent",
+      "memory.used",
+    ] {
+      assert!(ids.contains(&expected), "missing demo sensor {expected}");
+    }
   }
 
   #[tokio::test]
-  async fn test_new_demo_poll_returns_four_samples_in_range() {
+  async fn test_new_demo_poll_returns_samples_within_per_sensor_range() {
     let provider = MockProvider::new_demo();
     let samples = provider.poll().await.unwrap();
-    assert_eq!(samples.len(), 4);
+    assert_eq!(samples.len(), 7);
 
+    // Per-sensor plausible bounds: percentages and temps stay <= 100, while
+    // clock (MHz) and memory (MB) range much higher. Assert each value is
+    // finite, positive, and within a generous instrument ceiling.
     for sample in &samples {
       assert!(sample.timestamp_ms > 0);
       let value = sample.value.expect("demo sample should have a value");
-      assert!(
-        (0.0..=100.0).contains(&value),
-        "value {} out of range",
-        value
-      );
+      assert!(value.is_finite() && value >= 0.0, "value {value} invalid");
+      assert!(value <= 32768.0, "value {value} above instrument ceiling");
     }
   }
 

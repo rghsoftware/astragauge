@@ -13,12 +13,17 @@ use astragauge_provider_host::{HostConfig, Provider, ProviderHost};
 use astragauge_providers::MockProvider;
 use astragauge_sensor_store::SensorStore;
 
-/// The four sensors the demo provider is contracted to expose.
-const EXPECTED_SENSORS: [&str; 4] = [
-  "cpu.total.utilization",
-  "cpu.temperature",
-  "memory.used.percent",
-  "gpu.temperature",
+/// The sensors the demo provider is contracted to expose, paired with a
+/// generous plausible upper bound (percentages/temps stay <= 100; clock in MHz
+/// and memory in MB range much higher).
+const EXPECTED_SENSORS: [(&str, f64); 7] = [
+  ("cpu.total.utilization", 100.0),
+  ("cpu.clock", 5200.0),
+  ("cpu.temperature", 100.0),
+  ("gpu.total.utilization", 100.0),
+  ("gpu.temperature", 100.0),
+  ("memory.used.percent", 100.0),
+  ("memory.used", 32768.0),
 ];
 
 #[tokio::test]
@@ -46,7 +51,7 @@ async fn demo_provider_flows_live_values_into_store() {
     sensor_ids.len()
   );
 
-  for id_str in EXPECTED_SENSORS {
+  for (id_str, ceiling) in EXPECTED_SENSORS {
     let id = SensorId::new(id_str).expect("valid sensor id");
 
     let descriptor = store
@@ -64,8 +69,8 @@ async fn demo_provider_flows_live_values_into_store() {
       .unwrap_or_else(|| panic!("{id_str} should have a concrete value, not null"));
 
     assert!(
-      (0.0..=100.0).contains(&value),
-      "{id_str} value {value} should be within the contracted 0..=100 range"
+      (0.0..=ceiling).contains(&value),
+      "{id_str} value {value} should be within its contracted 0..={ceiling} range"
     );
   }
 
