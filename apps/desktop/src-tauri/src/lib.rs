@@ -5,11 +5,55 @@ use astragauge_provider_host::{HostConfig, ProviderHost};
 use astragauge_providers::MockProvider;
 use astragauge_sensor_store::SensorStore;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
+
+/// Live sensor reading emitted to the frontend. Field names are serialized
+/// as camelCase to match the TypeScript `SensorReading` interface.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SensorReading {
+  pub id: String,
+  pub name: String,
+  pub category: String,
+  pub unit: String,
+  pub value: Option<f64>,
+  #[serde(rename = "timestampMs")]
+  pub timestamp_ms: u64,
+}
+
+/// Builds a snapshot of all sensors currently registered in the store.
+/// Shared by the `get_sensor_snapshot` command and the background emitter
+/// so both produce an identical payload.
+async fn build_snapshot(store: &SensorStore) -> Vec<SensorReading> {
+  let sensor_ids = store.list_sensors().await;
+
+  let mut readings = Vec::new();
+  for sensor_id in sensor_ids {
+    if let Some(descriptor) = store.get_descriptor(&sensor_id).await {
+      let (value, timestamp_ms) = match store.get_value_with_timestamp(&sensor_id).await {
+        Some((sample, ts)) => (sample.value, ts),
+        None => (None, 0),
+      };
+
+      readings.push(SensorReading {
+        id: descriptor.id.to_string(),
+        name: descriptor.name,
+        category: descriptor.category,
+        unit: descriptor.unit,
+        value,
+        timestamp_ms,
+      });
+    }
+  }
+
+  readings
+}
 
 #[tauri::command]
-fn greet(name: &str) -> String {
-  format!("Hello, {}! You've been greeted from Rust!", name)
+async fn get_sensor_snapshot(
+  store: State<'_, Arc<SensorStore>>,
+) -> Result<Vec<SensorReading>, String> {
+  Ok(build_snapshot(&store).await)
 }
 
 #[tauri::command]
@@ -66,7 +110,7 @@ pub fn run() {
   let config = HostConfig::default();
   let host = Arc::new(std::sync::RwLock::new(ProviderHost::new(config, store)));
 
-  let mock_provider = MockProvider::new_test();
+  let mock_provider = MockProvider::new_demo();
   let mock_provider_arc: Arc<Box<dyn astragauge_provider_host::Provider>> =
     Arc::new(Box::new(mock_provider));
   host
@@ -76,17 +120,18 @@ pub fn run() {
     .expect("Failed to register MockProvider");
 
   let host_clone = Arc::clone(&host);
+  let store_for_emitter = Arc::clone(&store_clone);
 
   tauri::Builder::default()
     .plugin(tauri_plugin_opener::init())
     .manage(host)
     .manage(store_clone)
     .invoke_handler(tauri::generate_handler![
-      greet,
       get_providers_status,
-      list_available_sensors
+      list_available_sensors,
+      get_sensor_snapshot
     ])
-    .setup(move |_app| {
+    .setup(move |app| {
       tauri::async_runtime::spawn(async move {
         match host_clone.write() {
           Ok(mut host) => {
@@ -97,6 +142,19 @@ pub fn run() {
           }
         }
       });
+
+      let app_handle = app.handle().clone();
+      tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+          tick.tick().await;
+          let readings = build_snapshot(&store_for_emitter).await;
+          if let Err(e) = app_handle.emit("sensors-update", &readings) {
+            tracing::error!("Failed to emit sensors-update event: {}", e);
+          }
+        }
+      });
+
       Ok(())
     })
     .run(tauri::generate_context!())

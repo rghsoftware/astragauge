@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::f64::consts::PI;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use astragauge_domain::{
@@ -13,12 +14,24 @@ use astragauge_domain::{
 };
 use astragauge_provider_host::{Provider, ProviderHealth, ProviderResult};
 
+/// Parameters for a time-varying demo sensor: descriptor plus the
+/// (base, amplitude, period_ms) used to compute a sine-based value.
+struct DemoSensor {
+  descriptor: SensorDescriptor,
+  base: f64,
+  amplitude: f64,
+  period_ms: u64,
+}
+
 /// A mock provider for testing that returns configurable sensor data.
 pub struct MockProvider {
   descriptors: Vec<SensorDescriptor>,
   values: HashMap<SensorId, f64>,
   poll_interval: Duration,
   manifest: ProviderManifest,
+  /// When non-empty, `poll()` emits time-varying sine values from these
+  /// instead of the static `values` map.
+  demo_sensors: Vec<DemoSensor>,
 }
 
 impl MockProvider {
@@ -33,6 +46,7 @@ impl MockProvider {
       descriptors,
       values,
       poll_interval,
+      demo_sensors: Vec::new(),
     }
   }
 
@@ -60,6 +74,79 @@ impl MockProvider {
       descriptors: vec![descriptor],
       values,
       poll_interval: Duration::from_millis(10),
+      demo_sensors: Vec::new(),
+    }
+  }
+
+  /// Creates a MockProvider with four time-varying demo sensors so the UI
+  /// visibly updates. Each sensor's value follows a sine wave:
+  /// `value = clamp(base + amplitude * sin(2*pi*(now_ms % period_ms) / period_ms), 0, 100)`.
+  ///
+  /// Poll interval is 500ms.
+  pub fn new_demo() -> Self {
+    let demo_sensors = vec![
+      DemoSensor {
+        descriptor: SensorDescriptor {
+          id: SensorId::new("cpu.total.utilization").expect("valid sensor id"),
+          name: "CPU Utilization".to_string(),
+          category: "utilization".to_string(),
+          unit: "percent".to_string(),
+          device: None,
+          tags: vec![],
+        },
+        base: 45.0,
+        amplitude: 35.0,
+        period_ms: 7000,
+      },
+      DemoSensor {
+        descriptor: SensorDescriptor {
+          id: SensorId::new("cpu.temperature").expect("valid sensor id"),
+          name: "CPU Temperature".to_string(),
+          category: "temperature".to_string(),
+          unit: "celsius".to_string(),
+          device: None,
+          tags: vec![],
+        },
+        base: 55.0,
+        amplitude: 18.0,
+        period_ms: 11000,
+      },
+      DemoSensor {
+        descriptor: SensorDescriptor {
+          id: SensorId::new("memory.used.percent").expect("valid sensor id"),
+          name: "Memory Used".to_string(),
+          category: "utilization".to_string(),
+          unit: "percent".to_string(),
+          device: None,
+          tags: vec![],
+        },
+        base: 60.0,
+        amplitude: 20.0,
+        period_ms: 17000,
+      },
+      DemoSensor {
+        descriptor: SensorDescriptor {
+          id: SensorId::new("gpu.temperature").expect("valid sensor id"),
+          name: "GPU Temperature".to_string(),
+          category: "temperature".to_string(),
+          unit: "celsius".to_string(),
+          device: None,
+          tags: vec![],
+        },
+        base: 50.0,
+        amplitude: 22.0,
+        period_ms: 13000,
+      },
+    ];
+
+    let descriptors = demo_sensors.iter().map(|s| s.descriptor.clone()).collect();
+
+    Self {
+      manifest: create_test_manifest(),
+      descriptors,
+      values: HashMap::new(),
+      poll_interval: Duration::from_millis(500),
+      demo_sensors,
     }
   }
 }
@@ -106,6 +193,23 @@ impl Provider for MockProvider {
       .duration_since(UNIX_EPOCH)
       .map(|d| d.as_millis() as u64)
       .unwrap_or(0);
+
+    if !self.demo_sensors.is_empty() {
+      let samples: Vec<SensorSample> = self
+        .demo_sensors
+        .iter()
+        .map(|s| {
+          let phase = (timestamp_ms % s.period_ms) as f64 / s.period_ms as f64;
+          let value = (s.base + s.amplitude * (2.0 * PI * phase).sin()).clamp(0.0, 100.0);
+          SensorSample {
+            sensor_id: s.descriptor.id.clone(),
+            timestamp_ms,
+            value: Some(value),
+          }
+        })
+        .collect();
+      return Ok(samples);
+    }
 
     let samples: Vec<SensorSample> = self
       .values
@@ -190,6 +294,42 @@ mod tests {
     let provider = MockProvider::new_test();
     let result = provider.shutdown().await;
     assert!(result.is_ok());
+  }
+
+  #[test]
+  fn test_new_demo_has_500ms_poll_interval() {
+    let provider = MockProvider::new_demo();
+    assert_eq!(provider.poll_interval(), Duration::from_millis(500));
+  }
+
+  #[tokio::test]
+  async fn test_new_demo_discovers_four_sensors() {
+    let provider = MockProvider::new_demo();
+    let descriptors = provider.discover().await.unwrap();
+    assert_eq!(descriptors.len(), 4);
+
+    let ids: Vec<&str> = descriptors.iter().map(|d| d.id.as_str()).collect();
+    assert!(ids.contains(&"cpu.total.utilization"));
+    assert!(ids.contains(&"cpu.temperature"));
+    assert!(ids.contains(&"memory.used.percent"));
+    assert!(ids.contains(&"gpu.temperature"));
+  }
+
+  #[tokio::test]
+  async fn test_new_demo_poll_returns_four_samples_in_range() {
+    let provider = MockProvider::new_demo();
+    let samples = provider.poll().await.unwrap();
+    assert_eq!(samples.len(), 4);
+
+    for sample in &samples {
+      assert!(sample.timestamp_ms > 0);
+      let value = sample.value.expect("demo sample should have a value");
+      assert!(
+        (0.0..=100.0).contains(&value),
+        "value {} out of range",
+        value
+      );
+    }
   }
 
   #[tokio::test]
