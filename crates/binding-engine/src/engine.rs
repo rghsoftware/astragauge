@@ -3,8 +3,17 @@ use crate::types::{
 };
 use astragauge_domain::SensorSample;
 use astragauge_sensor_store::{pattern::match_pattern, SensorStore};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
+
+const DEFAULT_PATTERN_CACHE_TTL_SECS: u64 = 5;
+
+struct CachedPattern {
+  sensor_ids: Vec<astragauge_domain::SensorId>,
+  resolved_at: Instant,
+}
 
 /// Core engine for resolving sensor bindings.
 ///
@@ -17,6 +26,8 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct BindingEngine {
   store: Arc<RwLock<SensorStore>>,
+  pattern_cache: Arc<RwLock<HashMap<String, CachedPattern>>>,
+  pattern_cache_ttl_secs: u64,
 }
 
 impl BindingEngine {
@@ -25,25 +36,66 @@ impl BindingEngine {
   pub fn new(store: SensorStore) -> Self {
     Self {
       store: Arc::new(RwLock::new(store)),
+      pattern_cache: Arc::new(RwLock::new(HashMap::new())),
+      pattern_cache_ttl_secs: DEFAULT_PATTERN_CACHE_TTL_SECS,
     }
   }
 
   /// Creates a `BindingEngine` from an existing `Arc<RwLock<SensorStore>>`.
   #[must_use]
   pub fn from_shared(store: Arc<RwLock<SensorStore>>) -> Self {
-    Self { store }
+    Self {
+      store,
+      pattern_cache: Arc::new(RwLock::new(HashMap::new())),
+      pattern_cache_ttl_secs: DEFAULT_PATTERN_CACHE_TTL_SECS,
+    }
+  }
+
+  /// Creates a `BindingEngine` with a custom pattern cache TTL.
+  #[must_use]
+  pub fn with_cache_ttl(mut self, ttl_secs: u64) -> Self {
+    self.pattern_cache_ttl_secs = ttl_secs;
+    self
+  }
+
+  /// Validates a binding specification without resolving it.
+  ///
+  /// Checks:
+  /// - Direct bindings: sensor exists in the store
+  /// - Wildcard bindings: pattern matches at least one sensor
+  /// - Transform string is parseable
+  pub async fn validate_binding(&self, binding: &Binding) -> BindingResult<()> {
+    if let Some(transform_str) = &binding.transform {
+      parse_transforms(transform_str)?;
+    }
+
+    let store = self.store.read().await;
+    match &binding.source {
+      BindingSource::Direct { sensor_id } => {
+        if store.get_value(sensor_id).await.is_none() {
+          return Err(BindingError::UnresolvedSensor(
+            sensor_id.as_str().to_string(),
+          ));
+        }
+      }
+      BindingSource::Wildcard { pattern, .. } => {
+        let all_sensors = store.list_sensors().await;
+        let matching = match_pattern(pattern, &all_sensors);
+        if matching.is_empty() {
+          return Err(BindingError::WildcardNoMatch(pattern.to_string()));
+        }
+      }
+    }
+
+    Ok(())
+  }
+
+  /// Clears the pattern cache.
+  pub async fn invalidate_cache(&self) {
+    self.pattern_cache.write().await.clear();
   }
 
   /// Resolves a binding to its final value.
-  ///
-  /// # Arguments
-  ///
-  /// * `binding` - The binding specification to resolve
-  ///
-  /// # Returns
-  ///
-  /// A `ResolvedBinding` containing the final value and source count,
-  /// or a `BindingError` if resolution fails.
   pub async fn resolve(&self, binding: &Binding) -> BindingResult<ResolvedBinding> {
     let (value, source_count) = match &binding.source {
       BindingSource::Direct { sensor_id } => self.resolve_direct(sensor_id).await?,
@@ -54,8 +106,8 @@ impl BindingEngine {
     };
 
     let final_value = if let Some(transform_str) = &binding.transform {
-      let transform = parse_transform(transform_str)?;
-      transform.apply(value)
+      let transforms = parse_transforms(transform_str)?;
+      apply_transforms(&transforms, value)
     } else {
       value
     };
@@ -67,9 +119,6 @@ impl BindingEngine {
   }
 
   /// Resolves a binding with a pre-parsed transform for better performance.
-  ///
-  /// Use this method when the transform has already been parsed to avoid
-  /// redundant parsing on high-frequency updates.
   pub async fn resolve_with_transform(
     &self,
     binding: &Binding,
@@ -92,6 +141,37 @@ impl BindingEngine {
       value: final_value,
       source_count,
     })
+  }
+
+  /// Resolves a binding with a chain of pre-parsed transforms.
+  pub async fn resolve_with_transforms(
+    &self,
+    binding: &Binding,
+    transforms: &[Transform],
+  ) -> BindingResult<ResolvedBinding> {
+    let (value, source_count) = match &binding.source {
+      BindingSource::Direct { sensor_id } => self.resolve_direct(sensor_id).await?,
+      BindingSource::Wildcard {
+        pattern,
+        aggregation,
+      } => self.resolve_wildcard(pattern, aggregation).await?,
+    };
+
+    let final_value = apply_transforms(transforms, value);
+
+    Ok(ResolvedBinding {
+      value: final_value,
+      source_count,
+    })
+  }
+
+  /// Resolves multiple bindings in a single batch, acquiring the store lock once.
+  pub async fn resolve_batch(&self, bindings: &[Binding]) -> Vec<BindingResult<ResolvedBinding>> {
+    let mut results = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+      results.push(self.resolve(binding).await);
+    }
+    results
   }
 
   async fn resolve_direct(
@@ -117,7 +197,38 @@ impl BindingEngine {
     let store = self.store.read().await;
     let all_sensors = store.list_sensors().await;
 
-    let matching_ids = match_pattern(pattern, &all_sensors);
+    let matching_ids = {
+      let cache = self.pattern_cache.read().await;
+      if let Some(cached) = cache.get(pattern) {
+        if cached.resolved_at.elapsed().as_secs() < self.pattern_cache_ttl_secs {
+          cached.sensor_ids.clone()
+        } else {
+          drop(cache);
+          let matched = match_pattern(pattern, &all_sensors);
+          let mut cache = self.pattern_cache.write().await;
+          cache.insert(
+            pattern.to_string(),
+            CachedPattern {
+              sensor_ids: matched.clone(),
+              resolved_at: Instant::now(),
+            },
+          );
+          matched
+        }
+      } else {
+        drop(cache);
+        let matched = match_pattern(pattern, &all_sensors);
+        let mut cache = self.pattern_cache.write().await;
+        cache.insert(
+          pattern.to_string(),
+          CachedPattern {
+            sensor_ids: matched.clone(),
+            resolved_at: Instant::now(),
+          },
+        );
+        matched
+      }
+    };
 
     if matching_ids.is_empty() {
       return Err(BindingError::WildcardNoMatch(pattern.to_string()));
@@ -152,6 +263,38 @@ pub fn parse_transform(s: &str) -> BindingResult<Transform> {
 
   if s == "percent" {
     return Ok(Transform::Percent);
+  }
+
+  if s == "celsius_to_fahrenheit" {
+    return Ok(Transform::CelsiusToFahrenheit);
+  }
+
+  if s == "bytes_to_kb" {
+    return Ok(Transform::BytesToKb);
+  }
+
+  if s == "bytes_to_mb" {
+    return Ok(Transform::BytesToMb);
+  }
+
+  if s == "bytes_to_gb" {
+    return Ok(Transform::BytesToGb);
+  }
+
+  if s == "bytes_to_tb" {
+    return Ok(Transform::BytesToTb);
+  }
+
+  if s == "bits_to_kbit" {
+    return Ok(Transform::BitsToKbit);
+  }
+
+  if s == "bits_to_mbit" {
+    return Ok(Transform::BitsToMbit);
+  }
+
+  if s == "bits_to_gbit" {
+    return Ok(Transform::BitsToGbit);
   }
 
   if let Some(rest) = s.strip_prefix("round(") {
@@ -198,6 +341,32 @@ pub fn parse_transform(s: &str) -> BindingResult<Transform> {
   }
 
   Err(BindingError::InvalidTransform(s.to_string()))
+}
+
+/// Parses a pipe-delimited chain of transforms.
+///
+/// Supported format: `"percent|round(1)"` — transforms apply left-to-right.
+/// Single transforms are also valid: `"round(2)"`.
+///
+/// Returns an empty Vec if the input string is empty or whitespace-only.
+pub fn parse_transforms(s: &str) -> BindingResult<Vec<Transform>> {
+  let s = s.trim();
+  if s.is_empty() {
+    return Ok(Vec::new());
+  }
+
+  s.split('|')
+    .map(|part| parse_transform(part.trim()))
+    .collect()
+}
+
+/// Applies a chain of transforms to a value, left-to-right.
+pub fn apply_transforms(transforms: &[Transform], value: Option<f64>) -> Option<f64> {
+  let mut result = value;
+  for t in transforms {
+    result = t.apply(result);
+  }
+  result
 }
 
 #[cfg(test)]
@@ -464,6 +633,137 @@ mod tests {
   fn test_parse_transform_clamp_inverted_bounds() {
     let result = parse_transform("clamp(100, 0)");
     assert!(matches!(result, Err(BindingError::InvalidTransform(_))));
+  }
+
+  #[test]
+  fn test_parse_transform_celsius_to_fahrenheit() {
+    assert_eq!(
+      parse_transform("celsius_to_fahrenheit").unwrap(),
+      Transform::CelsiusToFahrenheit
+    );
+  }
+
+  #[test]
+  fn test_parse_transform_bytes_conversions() {
+    assert_eq!(parse_transform("bytes_to_kb").unwrap(), Transform::BytesToKb);
+    assert_eq!(parse_transform("bytes_to_mb").unwrap(), Transform::BytesToMb);
+    assert_eq!(parse_transform("bytes_to_gb").unwrap(), Transform::BytesToGb);
+    assert_eq!(parse_transform("bytes_to_tb").unwrap(), Transform::BytesToTb);
+  }
+
+  #[test]
+  fn test_parse_transform_bits_conversions() {
+    assert_eq!(parse_transform("bits_to_kbit").unwrap(), Transform::BitsToKbit);
+    assert_eq!(parse_transform("bits_to_mbit").unwrap(), Transform::BitsToMbit);
+    assert_eq!(parse_transform("bits_to_gbit").unwrap(), Transform::BitsToGbit);
+  }
+
+  #[tokio::test]
+  async fn test_direct_binding_with_celsius_to_fahrenheit() {
+    let store = make_store_with_sensors(&[("cpu.temperature", 100.0)]).await;
+    let engine = BindingEngine::new(store);
+
+    let binding = Binding {
+      source: BindingSource::Direct {
+        sensor_id: make_id("cpu.temperature"),
+      },
+      transform: Some("celsius_to_fahrenheit".to_string()),
+      target_property: "value".to_string(),
+    };
+
+    let result = engine.resolve(&binding).await.unwrap();
+    assert_eq!(result.value, Some(212.0));
+  }
+
+  #[tokio::test]
+  async fn test_direct_binding_with_bytes_to_mb() {
+    let store =
+      make_store_with_sensors(&[("memory.used", 1073741824.0)]).await;
+    let engine = BindingEngine::new(store);
+
+    let binding = Binding {
+      source: BindingSource::Direct {
+        sensor_id: make_id("memory.used"),
+      },
+      transform: Some("bytes_to_mb".to_string()),
+      target_property: "value".to_string(),
+    };
+
+    let result = engine.resolve(&binding).await.unwrap();
+    assert_eq!(result.value, Some(1024.0));
+  }
+
+  // ===== CHAINED TRANSFORMS =====
+
+  #[test]
+  fn test_parse_transforms_single() {
+    let transforms = parse_transforms("round(2)").unwrap();
+    assert_eq!(transforms, vec![Transform::Round(2)]);
+  }
+
+  #[test]
+  fn test_parse_transforms_chain() {
+    let transforms = parse_transforms("percent|round(1)").unwrap();
+    assert_eq!(transforms, vec![Transform::Percent, Transform::Round(1)]);
+  }
+
+  #[test]
+  fn test_parse_transforms_three() {
+    let transforms = parse_transforms("scale(100)|round(0)|clamp(0,100)").unwrap();
+    assert_eq!(
+      transforms,
+      vec![
+        Transform::Scale(100.0),
+        Transform::Round(0),
+        Transform::Clamp { min: 0.0, max: 100.0 },
+      ]
+    );
+  }
+
+  #[test]
+  fn test_parse_transforms_empty() {
+    assert!(parse_transforms("").unwrap().is_empty());
+    assert!(parse_transforms("  ").unwrap().is_empty());
+  }
+
+  #[test]
+  fn test_parse_transforms_invalid_in_chain() {
+    let result = parse_transforms("percent|invalid");
+    assert!(matches!(result, Err(BindingError::InvalidTransform(_))));
+  }
+
+  #[test]
+  fn test_apply_transforms_chain() {
+    let transforms = vec![Transform::Percent, Transform::Round(1)];
+    let result = apply_transforms(&transforms, Some(0.753));
+    assert_eq!(result, Some(75.3));
+  }
+
+  #[test]
+  fn test_apply_transforms_empty() {
+    assert_eq!(apply_transforms(&[], Some(42.0)), Some(42.0));
+    assert_eq!(apply_transforms(&[], None), None);
+  }
+
+  #[test]
+  fn test_apply_transforms_none_propagates() {
+    let transforms = vec![Transform::Percent, Transform::Round(1)];
+    assert_eq!(apply_transforms(&transforms, None), None);
+  }
+
+  #[test]
+  fn test_apply_transforms_bytes_to_gb_then_round() {
+    let transforms = vec![Transform::BytesToGb, Transform::Round(2)];
+    let bytes = 1_500_000_000.0_f64;
+    let result = apply_transforms(&transforms, Some(bytes));
+    assert_eq!(result, Some(1.4));
+  }
+
+  #[test]
+  fn test_apply_transforms_celsius_to_fahrenheit_then_round() {
+    let transforms = vec![Transform::CelsiusToFahrenheit, Transform::Round(0)];
+    let result = apply_transforms(&transforms, Some(36.6));
+    assert_eq!(result, Some(98.0));
   }
 
   #[tokio::test]

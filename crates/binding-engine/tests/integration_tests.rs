@@ -1,6 +1,6 @@
 use astragauge_binding_engine::{
   engine::BindingEngine, subscription::BindingSubscription, Aggregation, Binding, BindingError,
-  BindingSource,
+  BindingSource, FormatSpec, format_value,
 };
 use astragauge_domain::{SensorDescriptor, SensorId, SensorSample};
 use astragauge_sensor_store::SensorStore;
@@ -354,4 +354,289 @@ async fn integration_multiple_subscriptions_share_engine() {
   }
 
   assert_eq!(received_binding_ids.len(), 2);
+}
+
+// ===== UNIT CONVERSION INTEGRATION =====
+
+#[tokio::test]
+async fn integration_celsius_to_fahrenheit_binding() {
+  let store = make_store_with_sensors(&[("cpu.temperature", 36.6)]).await;
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Direct {
+      sensor_id: make_id("cpu.temperature"),
+    },
+    transform: Some("celsius_to_fahrenheit".to_string()),
+    target_property: "value".to_string(),
+  };
+
+  let result = engine.resolve(&binding).await.unwrap();
+  let expected = 36.6 * 9.0 / 5.0 + 32.0;
+  assert!((result.value.unwrap() - expected).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn integration_bytes_to_gb_with_format() {
+  let store =
+    make_store_with_sensors(&[("disk.used", 150000000000.0)]).await;
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Direct {
+      sensor_id: make_id("disk.used"),
+    },
+    transform: Some("bytes_to_gb|round(1)".to_string()),
+    target_property: "value".to_string(),
+  };
+
+  let result = engine.resolve(&binding).await.unwrap();
+  let formatted = format_value(
+    &result,
+    &FormatSpec {
+      decimal_places: 1,
+      unit_suffix: Some(" GB".to_string()),
+      na_string: "N/A".to_string(),
+    },
+  );
+  assert_eq!(formatted.formatted_value, "139.7 GB");
+}
+
+// ===== CHAINED TRANSFORMS INTEGRATION =====
+
+#[tokio::test]
+async fn integration_chained_percent_round() {
+  let store = make_store_with_sensors(&[("cpu.utilization", 0.753)]).await;
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Direct {
+      sensor_id: make_id("cpu.utilization"),
+    },
+    transform: Some("percent|round(1)".to_string()),
+    target_property: "value".to_string(),
+  };
+
+  let result = engine.resolve(&binding).await.unwrap();
+  assert_eq!(result.value, Some(75.3));
+}
+
+#[tokio::test]
+async fn integration_chained_wildcard_with_transforms() {
+  let store = make_store_with_sensors(&[
+    ("cpu.core0.load", 0.45),
+    ("cpu.core1.load", 0.55),
+  ])
+  .await;
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Wildcard {
+      pattern: "cpu.core*.load".to_string(),
+      aggregation: Aggregation::Avg,
+    },
+    transform: Some("percent|round(0)".to_string()),
+    target_property: "value".to_string(),
+  };
+
+  let result = engine.resolve(&binding).await.unwrap();
+  assert_eq!(result.value, Some(50.0));
+}
+
+// ===== BATCH RESOLUTION =====
+
+#[tokio::test]
+async fn integration_batch_resolution() {
+  let store = make_store_with_sensors(&[
+    ("cpu.temperature", 42.5),
+    ("gpu.temperature", 70.0),
+    ("memory.used", 8589934592.0),
+  ])
+  .await;
+  let engine = BindingEngine::new(store);
+
+  let bindings = vec![
+    Binding {
+      source: BindingSource::Direct {
+        sensor_id: make_id("cpu.temperature"),
+      },
+      transform: None,
+      target_property: "value".to_string(),
+    },
+    Binding {
+      source: BindingSource::Direct {
+        sensor_id: make_id("memory.used"),
+      },
+      transform: Some("bytes_to_gb|round(1)".to_string()),
+      target_property: "value".to_string(),
+    },
+    Binding {
+      source: BindingSource::Direct {
+        sensor_id: make_id("gpu.temperature"),
+      },
+      transform: Some("celsius_to_fahrenheit".to_string()),
+      target_property: "value".to_string(),
+    },
+  ];
+
+  let results = engine.resolve_batch(&bindings).await;
+  assert_eq!(results.len(), 3);
+  assert_eq!(results[0].as_ref().unwrap().value, Some(42.5));
+  assert_eq!(results[1].as_ref().unwrap().value, Some(8.0));
+  assert_eq!(results[2].as_ref().unwrap().value, Some(158.0));
+}
+
+#[tokio::test]
+async fn integration_batch_with_errors() {
+  let store = make_store_with_sensors(&[("cpu.temperature", 42.5)]).await;
+  let engine = BindingEngine::new(store);
+
+  let bindings = vec![
+    Binding {
+      source: BindingSource::Direct {
+        sensor_id: make_id("cpu.temperature"),
+      },
+      transform: None,
+      target_property: "value".to_string(),
+    },
+    Binding {
+      source: BindingSource::Direct {
+        sensor_id: make_id("nonexistent.sensor"),
+      },
+      transform: None,
+      target_property: "value".to_string(),
+    },
+  ];
+
+  let results = engine.resolve_batch(&bindings).await;
+  assert!(results[0].is_ok());
+  assert!(matches!(results[1], Err(BindingError::UnresolvedSensor(_))));
+}
+
+// ===== VALIDATION =====
+
+#[tokio::test]
+async fn integration_validate_valid_binding() {
+  let store = make_store_with_sensors(&[("cpu.temperature", 42.5)]).await;
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Direct {
+      sensor_id: make_id("cpu.temperature"),
+    },
+    transform: Some("percent|round(1)".to_string()),
+    target_property: "value".to_string(),
+  };
+
+  assert!(engine.validate_binding(&binding).await.is_ok());
+}
+
+#[tokio::test]
+async fn integration_validate_missing_sensor() {
+  let store = make_store_with_sensors(&[("cpu.temperature", 42.5)]).await;
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Direct {
+      sensor_id: make_id("gpu.temperature"),
+    },
+    transform: None,
+    target_property: "value".to_string(),
+  };
+
+  let result = engine.validate_binding(&binding).await;
+  assert!(matches!(result, Err(BindingError::UnresolvedSensor(_))));
+}
+
+#[tokio::test]
+async fn integration_validate_bad_transform() {
+  let store = make_store_with_sensors(&[("cpu.temperature", 42.5)]).await;
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Direct {
+      sensor_id: make_id("cpu.temperature"),
+    },
+    transform: Some("bad_transform".to_string()),
+    target_property: "value".to_string(),
+  };
+
+  let result = engine.validate_binding(&binding).await;
+  assert!(matches!(result, Err(BindingError::InvalidTransform(_))));
+}
+
+// ===== FORMATTING PIPELINE =====
+
+#[tokio::test]
+async fn integration_full_pipeline_with_formatting() {
+  let store = make_store_with_sensors(&[("cpu.utilization", 0.753)]).await;
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Direct {
+      sensor_id: make_id("cpu.utilization"),
+    },
+    transform: Some("percent|round(1)".to_string()),
+    target_property: "value".to_string(),
+  };
+
+  let result = engine.resolve(&binding).await.unwrap();
+  let formatted = format_value(
+    &result,
+    &FormatSpec {
+      decimal_places: 1,
+      unit_suffix: Some("%".to_string()),
+      na_string: "N/A".to_string(),
+    },
+  );
+
+  assert_eq!(formatted.formatted_value, "75.3%");
+  assert_eq!(formatted.raw_value, Some(75.3));
+  assert_eq!(formatted.source_count, 1);
+}
+
+#[tokio::test]
+async fn integration_formatting_none_value() {
+  let store = SensorStore::new();
+  let engine = BindingEngine::new(store);
+
+  let binding = Binding {
+    source: BindingSource::Direct {
+      sensor_id: make_id("nonexistent.sensor"),
+    },
+    transform: None,
+    target_property: "value".to_string(),
+  };
+
+  let result = engine.resolve(&binding).await;
+  assert!(result.is_err());
+}
+
+// ===== PATTERN CACHE =====
+
+#[tokio::test]
+async fn integration_pattern_cache_consistency() {
+  let store = make_store_with_sensors(&[
+    ("cpu.core0.temperature", 40.0),
+    ("cpu.core1.temperature", 50.0),
+  ])
+  .await;
+  let engine = BindingEngine::new(store.clone());
+
+  let binding = Binding {
+    source: BindingSource::Wildcard {
+      pattern: "cpu.core*.temperature".to_string(),
+      aggregation: Aggregation::Avg,
+    },
+    transform: None,
+    target_property: "value".to_string(),
+  };
+
+  let result1 = engine.resolve(&binding).await.unwrap();
+  assert_eq!(result1.value, Some(45.0));
+
+  update_sensor_value(&store, "cpu.core0.temperature", 60.0, 2000).await;
+
+  let result2 = engine.resolve(&binding).await.unwrap();
+  assert_eq!(result2.value, Some(55.0));
 }

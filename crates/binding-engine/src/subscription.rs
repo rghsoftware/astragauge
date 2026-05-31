@@ -1,4 +1,4 @@
-use crate::engine::{parse_transform, BindingEngine};
+use crate::engine::{parse_transforms, BindingEngine};
 use crate::types::{Binding, BindingResult, BindingSource, ResolvedBinding, Transform};
 use astragauge_domain::SensorId;
 use astragauge_sensor_store::pattern::match_pattern;
@@ -19,11 +19,11 @@ pub struct BindingNotification {
   pub result: BindingResult<ResolvedBinding>,
 }
 
-/// Cached binding with pre-parsed transform for performance.
+/// Cached binding with pre-parsed transform chain for performance.
 #[derive(Clone)]
 struct CachedBinding {
   binding: Binding,
-  parsed_transform: Option<Transform>,
+  parsed_transforms: Vec<Transform>,
 }
 
 /// Manages subscriptions for binding updates.
@@ -53,9 +53,9 @@ impl BindingSubscription {
     binding_id: String,
     binding: Binding,
   ) -> crate::types::BindingResult<()> {
-    let parsed_transform = match &binding.transform {
-      Some(transform_str) => Some(parse_transform(transform_str)?),
-      None => None,
+    let parsed_transforms = match &binding.transform {
+      Some(transform_str) => parse_transforms(transform_str)?,
+      None => Vec::new(),
     };
 
     let mut bindings = self.bindings.write().await;
@@ -63,7 +63,7 @@ impl BindingSubscription {
       binding_id,
       CachedBinding {
         binding,
-        parsed_transform,
+        parsed_transforms,
       },
     );
     Ok(())
@@ -111,7 +111,7 @@ impl BindingSubscription {
       Some(cached) => {
         self
           .engine
-          .resolve_with_transform(&cached.binding, cached.parsed_transform.as_ref())
+          .resolve_with_transforms(&cached.binding, &cached.parsed_transforms)
           .await
       }
       None => Err(crate::types::BindingError::BindingNotFound(

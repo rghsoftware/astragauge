@@ -9,8 +9,9 @@ pub mod transform;
 pub mod types;
 
 pub use crate::aggregation::AggregationResult;
-pub use crate::engine::{parse_transform, BindingEngine};
+pub use crate::engine::{apply_transforms, parse_transform, parse_transforms, BindingEngine};
 pub use crate::subscription::BindingSubscription;
 pub use crate::types::{
-  Aggregation, Binding, BindingError, BindingResult, BindingSource, ResolvedBinding, Transform,
+  Aggregation, Binding, BindingError, BindingResult, BindingSource, FormattedBinding, FormatSpec,
+  ResolvedBinding, Transform, format_value,
 };
