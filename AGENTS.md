@@ -177,3 +177,8 @@ The aesthetic evokes instrumentation, constellations, and precision measurement.
 3. **Typography for Precision:** Use monospaced fonts (JetBrains Mono, IBM Plex Mono) for numeric values to prevent jitter during updates, and clean sans-serif (Inter, IBM Plex Sans) for labels.
 4. **Semantic Color Rules:** Never hardcode colors. Always use the semantic role system (`background`, `surface`, `text-primary`, `text-secondary`, `accent`, `good`, `warn`, `critical`) to ensure theme compatibility across both light and dark modes.
 5. **Grid Consistency:** Strictly adhere to the 8px base grid for sizing and snapping widgets to maintain alignment and composability.
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+<!-- SPECKIT END -->
