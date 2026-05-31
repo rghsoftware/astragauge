@@ -1,9 +1,10 @@
 use astragauge_domain::{SensorDescriptor, SensorId, SensorSample};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{RingBuffer, StoreError, StoreResult};
+use crate::subscription::{Subscription, SubscriptionId, SubscriptionManager};
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -51,6 +52,7 @@ struct SensorStoreInner {
 #[derive(Clone)]
 pub struct SensorStore {
   inner: Arc<RwLock<SensorStoreInner>>,
+  subscriptions: Arc<Mutex<SubscriptionManager>>,
 }
 
 impl SensorStore {
@@ -69,6 +71,7 @@ impl SensorStore {
         history: HashMap::new(),
         config,
       })),
+      subscriptions: Arc::new(Mutex::new(SubscriptionManager::new())),
     }
   }
 
@@ -101,14 +104,27 @@ impl SensorStore {
   }
 
   pub async fn push_sample(&self, sample: SensorSample) -> StoreResult<()> {
-    let mut store = self.inner.write().await;
-    Self::push_sample_inner(&mut store, sample)
+    let sample_clone = sample.clone();
+    {
+      let mut store = self.inner.write().await;
+      Self::push_sample_inner(&mut store, sample)?;
+    }
+    let subs = self.subscriptions.lock().await;
+    subs.notify_matching(&sample_clone);
+    Ok(())
   }
 
   pub async fn push_samples(&self, samples: &[SensorSample]) -> StoreResult<()> {
-    let mut store = self.inner.write().await;
-    for sample in samples {
-      Self::push_sample_inner(&mut store, sample.clone())?;
+    let samples_clone: Vec<SensorSample> = samples.to_vec();
+    {
+      let mut store = self.inner.write().await;
+      for sample in &samples_clone {
+        Self::push_sample_inner(&mut store, sample.clone())?;
+      }
+    }
+    let subs = self.subscriptions.lock().await;
+    for sample in &samples_clone {
+      subs.notify_matching(sample);
     }
     Ok(())
   }
@@ -158,6 +174,46 @@ impl SensorStore {
   pub async fn get_history(&self, id: &SensorId) -> Option<Vec<SensorSample>> {
     let store = self.inner.read().await;
     store.history.get(id).map(|h| h.iter().cloned().collect())
+  }
+
+  pub async fn subscribe(&self, pattern: &str) -> Subscription {
+    self.subscriptions.lock().await.subscribe(pattern)
+  }
+
+  pub async fn unsubscribe(&self, id: SubscriptionId) {
+    self.subscriptions.lock().await.unsubscribe(id)
+  }
+
+  pub async fn list_sensors_by_category(&self, category: &str) -> Vec<SensorId> {
+    let store = self.inner.read().await;
+    store
+      .descriptors
+      .iter()
+      .filter(|(_, d)| d.category == category)
+      .map(|(id, _)| id.clone())
+      .collect()
+  }
+
+  pub async fn query_pattern(&self, pattern: &str) -> Vec<SensorId> {
+    let store = self.inner.read().await;
+    let ids: Vec<SensorId> = store.descriptors.keys().cloned().collect();
+    crate::pattern::match_pattern(pattern, &ids)
+  }
+
+  pub async fn get_stale_sensors(&self, now_ms: u64) -> Vec<SensorId> {
+    let store = self.inner.read().await;
+    let threshold = store.config.staleness_threshold_ms;
+    store
+      .last_update
+      .iter()
+      .filter(|(_, &last)| now_ms.saturating_sub(last) > threshold)
+      .map(|(id, _)| id.clone())
+      .collect()
+  }
+
+  pub async fn sensor_count(&self) -> usize {
+    let store = self.inner.read().await;
+    store.descriptors.len()
   }
 }
 
