@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { formatValue } from '../format';
+
   interface Thresholds {
     warn?: number;
     critical?: number;
@@ -13,17 +15,19 @@
 
   let { value, unit, props = {} }: Props = $props();
 
-  // Geometry: 270-degree sweep, symmetric about the bottom gap.
-  const VIEWBOX = 100;
+  // Precision-dial geometry: a 250° sweep with a symmetric bottom gap.
   const CENTER = 50;
   const RADIUS = 40;
-  const STROKE = 9;
-  const START_ANGLE = 135; // degrees, bottom-left
-  const SWEEP = 270; // degrees
+  const START_ANGLE = 145; // bottom-left
+  const SWEEP = 250;
+  const TICKS = 11; // major tick marks around the dial
 
   const min = $derived(typeof props.min === 'number' ? (props.min as number) : 0);
   const max = $derived(typeof props.max === 'number' ? (props.max as number) : 100);
   const label = $derived(typeof props.label === 'string' ? (props.label as string) : undefined);
+  const decimals = $derived(
+    typeof props.decimals === 'number' ? (props.decimals as number) : undefined
+  );
   const thresholds = $derived(
     props.thresholds && typeof props.thresholds === 'object'
       ? (props.thresholds as Thresholds)
@@ -33,88 +37,74 @@
   const hasValue = $derived(value !== null && value !== undefined && Number.isFinite(value));
 
   const fraction = $derived.by(() => {
-    if (!hasValue) {
-      return 0;
-    }
+    if (!hasValue) return 0;
     const span = max - min;
-    if (span <= 0) {
-      return 0;
-    }
-    const raw = ((value as number) - min) / span;
-    return Math.min(1, Math.max(0, raw));
+    if (span <= 0) return 0;
+    return Math.min(1, Math.max(0, ((value as number) - min) / span));
   });
 
   const valueColor = $derived.by(() => {
-    if (!hasValue || !thresholds) {
-      return 'var(--ag-accent)';
-    }
+    if (!hasValue || !thresholds) return 'var(--ag-accent)';
     const v = value as number;
-    if (typeof thresholds.critical === 'number' && v >= thresholds.critical) {
+    if (typeof thresholds.critical === 'number' && v >= thresholds.critical)
       return 'var(--ag-critical)';
-    }
-    if (typeof thresholds.warn === 'number' && v >= thresholds.warn) {
-      return 'var(--ag-warn)';
-    }
+    if (typeof thresholds.warn === 'number' && v >= thresholds.warn) return 'var(--ag-warn)';
     return 'var(--ag-accent)';
   });
 
-  const displayValue = $derived(hasValue ? (value as number).toFixed(1) : 'N/A');
+  const displayValue = $derived(hasValue ? formatValue(value as number, decimals) : 'N/A');
 
-  // Convert a polar coordinate (degrees, clockwise from positive x-axis in SVG
-  // space where y grows downward) into a point on the arc circle.
-  function pointAt(angleDeg: number): { x: number; y: number } {
+  function pointAt(angleDeg: number, radius: number): { x: number; y: number } {
     const rad = (angleDeg * Math.PI) / 180;
-    return {
-      x: CENTER + RADIUS * Math.cos(rad),
-      y: CENTER + RADIUS * Math.sin(rad),
-    };
+    return { x: CENTER + radius * Math.cos(rad), y: CENTER + radius * Math.sin(rad) };
   }
 
   function arcPath(fromAngle: number, toAngle: number): string {
-    const start = pointAt(fromAngle);
-    const end = pointAt(toAngle);
-    const delta = toAngle - fromAngle;
-    const largeArc = delta > 180 ? 1 : 0;
-    // sweep flag 1 => clockwise (increasing angle) in SVG's y-down space.
+    const start = pointAt(fromAngle, RADIUS);
+    const end = pointAt(toAngle, RADIUS);
+    const largeArc = toAngle - fromAngle > 180 ? 1 : 0;
     return `M ${start.x} ${start.y} A ${RADIUS} ${RADIUS} 0 ${largeArc} 1 ${end.x} ${end.y}`;
   }
 
-  const backgroundPath = $derived(arcPath(START_ANGLE, START_ANGLE + SWEEP));
+  const trackPath = $derived(arcPath(START_ANGLE, START_ANGLE + SWEEP));
   const valuePath = $derived(arcPath(START_ANGLE, START_ANGLE + SWEEP * fraction));
+  const pointer = $derived(pointAt(START_ANGLE + SWEEP * fraction, RADIUS));
+
+  // Fine tick marks: short radial hairlines just inside the arc.
+  const ticks = $derived.by(() =>
+    Array.from({ length: TICKS }, (_, i) => {
+      const angle = START_ANGLE + (SWEEP * i) / (TICKS - 1);
+      const outer = pointAt(angle, RADIUS - 1);
+      const inner = pointAt(angle, RADIUS - 5);
+      return { x1: inner.x, y1: inner.y, x2: outer.x, y2: outer.y };
+    })
+  );
 </script>
 
 <div class="gauge" class:muted={!hasValue}>
   <svg
-    class="arc"
-    viewBox="0 0 {VIEWBOX} {VIEWBOX}"
+    class="dial"
+    viewBox="0 0 100 100"
     width="100%"
     height="100%"
     preserveAspectRatio="xMidYMid meet"
     role="img"
     aria-label={label ? `${label} gauge` : 'gauge'}
   >
-    <path
-      class="track"
-      d={backgroundPath}
-      fill="none"
-      stroke="var(--ag-border)"
-      stroke-width={STROKE}
-      stroke-linecap="round"
-    ></path>
+    <path d={trackPath} fill="none" stroke="var(--ag-track)" stroke-width="3"></path>
+    {#each ticks as t}
+      <line x1={t.x1} y1={t.y1} x2={t.x2} y2={t.y2} stroke="var(--ag-tick)" stroke-width="0.8"
+      ></line>
+    {/each}
     {#if hasValue && fraction > 0}
-      <path
-        class="value-arc"
-        d={valuePath}
-        fill="none"
-        stroke={valueColor}
-        stroke-width={STROKE}
-        stroke-linecap="round"
+      <path d={valuePath} fill="none" stroke={valueColor} stroke-width="3.5" stroke-linecap="round"
       ></path>
+      <circle cx={pointer.x} cy={pointer.y} r="2.4" fill={valueColor}></circle>
     {/if}
   </svg>
 
   <div class="readout">
-    <span class="value" style:color={hasValue ? valueColor : 'var(--ag-text-secondary)'}>
+    <span class="ag-numeric value" style:color={hasValue ? valueColor : 'var(--ag-text-secondary)'}>
       {displayValue}
     </span>
     {#if hasValue && unit}
@@ -136,16 +126,10 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    box-sizing: border-box;
-    padding: var(--ag-widget-padding);
-    background: var(--ag-surface);
-    border: 1px solid var(--ag-border);
-    border-radius: var(--ag-radius);
-    font-family: var(--ag-font-primary);
     container-type: size;
   }
 
-  .arc {
+  .dial {
     display: block;
     width: 100%;
     height: 100%;
@@ -158,34 +142,32 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: calc(var(--ag-grid) / 4);
+    gap: 1px;
     pointer-events: none;
     text-align: center;
   }
 
   .value {
-    font-family: var(--ag-font-numeric);
     color: var(--ag-text-primary);
-    font-size: clamp(0.9rem, 18cqmin, 2rem);
+    font-size: clamp(0.9rem, 22cqmin, 2.4rem);
     font-weight: 600;
-    line-height: 1.1;
+    line-height: 1.05;
   }
 
   .unit {
     font-family: var(--ag-font-primary);
     color: var(--ag-text-secondary);
-    font-size: clamp(0.55rem, 8cqmin, 0.85rem);
+    font-size: clamp(0.5rem, 7cqmin, 0.8rem);
     line-height: 1;
   }
 
   .label {
     font-family: var(--ag-font-primary);
     color: var(--ag-text-secondary);
-    font-size: clamp(0.6rem, 9cqmin, 0.9rem);
+    font-size: clamp(0.55rem, 8cqmin, 0.78rem);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-top: 2px;
     line-height: 1.1;
-  }
-
-  .muted .value {
-    color: var(--ag-text-secondary);
   }
 </style>

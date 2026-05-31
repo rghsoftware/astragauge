@@ -1,19 +1,30 @@
 /* AstraGauge global theme tokens and base styles.
    Variable names are FIXED per the binding contract — widgets reference
-   these exact --ag-* custom properties. Do NOT hardcode colors elsewhere. */
+   these exact --ag-* custom properties. Do NOT hardcode colors elsewhere.
+
+   The default identity is a calm, precise *instrument panel* (constellation /
+   precision-measurement motifs) — not an ops dashboard. Values here are the
+   restrained default theme; the system is fully themeable on top of these. */
 
 :root {
   /* Color roles — dark theme (default) */
-  --ag-background: #0f1115;
-  --ag-surface: #1a1e24;
-  --ag-surface-raised: #232831;
-  --ag-text-primary: #ffffff;
-  --ag-text-secondary: #9aa4b2;
-  --ag-accent: #4fa3ff;
+  --ag-background: #0a0c10;
+  --ag-surface: #0f141b;
+  --ag-surface-raised: #151b23;
+  --ag-text-primary: #eaf2ff;
+  --ag-text-secondary: #7e8a9a;
+  --ag-accent: #5bc2e7;
   --ag-good: #4cd964;
   --ag-warn: #ffc857;
-  --ag-critical: #ff4d4d;
-  --ag-border: rgba(255, 255, 255, 0.08);
+  --ag-critical: #ff5c5c;
+  --ag-border: rgba(255, 255, 255, 0.06);
+
+  /* Instrument detail roles (additive) */
+  --ag-hairline: rgba(255, 255, 255, 0.08);
+  --ag-tick: rgba(255, 255, 255, 0.16);
+  --ag-track: rgba(255, 255, 255, 0.07);
+  --ag-accent-dim: rgba(91, 194, 231, 0.22);
+  --ag-glow: rgba(91, 194, 231, 0.35);
 
   /* Typography (same across themes) */
   --ag-font-primary: 'Inter', system-ui, -apple-system, sans-serif;
@@ -22,21 +33,27 @@
   /* Spacing & shape (same across themes) */
   --ag-grid: 8px;
   --ag-widget-padding: 12px;
-  --ag-radius: 8px;
+  --ag-radius: 4px;
 }
 
 [data-theme='light'] {
-  /* Color roles — light theme */
-  --ag-background: #f6f7f9;
+  /* Color roles — light theme (clean lab-instrument light) */
+  --ag-background: #eceff3;
   --ag-surface: #ffffff;
-  --ag-surface-raised: #ffffff;
-  --ag-text-primary: #0f1115;
-  --ag-text-secondary: #5a6472;
-  --ag-accent: #2d7dd2;
-  --ag-good: #2ba84a;
-  --ag-warn: #c8860b;
-  --ag-critical: #d93535;
+  --ag-surface-raised: #f4f6f9;
+  --ag-text-primary: #11161d;
+  --ag-text-secondary: #5a6678;
+  --ag-accent: #1e88c7;
+  --ag-good: #1fa24a;
+  --ag-warn: #b8770a;
+  --ag-critical: #ce2f2f;
   --ag-border: rgba(0, 0, 0, 0.1);
+
+  --ag-hairline: rgba(0, 0, 0, 0.1);
+  --ag-tick: rgba(0, 0, 0, 0.22);
+  --ag-track: rgba(0, 0, 0, 0.08);
+  --ag-accent-dim: rgba(30, 136, 199, 0.16);
+  --ag-glow: rgba(30, 136, 199, 0.22);
 }
 
 *,
@@ -45,30 +62,29 @@
   box-sizing: border-box;
 }
 
-html {
-  min-height: 100vh;
+html,
+body {
+  height: 100%;
+  margin: 0;
 }
 
 body {
-  margin: 0;
-  min-height: 100vh;
   background: var(--ag-background);
   color: var(--ag-text-primary);
   font-family: var(--ag-font-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
-  /* Smooth transition when toggling themes */
+  overflow: hidden;
   transition:
-    background-color 0.2s ease,
-    color 0.2s ease;
+    background-color 0.25s ease,
+    color 0.25s ease;
 }
 
-/* Apply the same smooth color transition to themed surfaces/text */
-:root,
-[data-theme='light'] {
-  transition:
-    background-color 0.2s ease,
-    color 0.2s ease,
-    border-color 0.2s ease;
+/* Monospace numerics should not jitter as values change. */
+.ag-numeric {
+  font-family: var(--ag-font-numeric);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  letter-spacing: -0.01em;
 }

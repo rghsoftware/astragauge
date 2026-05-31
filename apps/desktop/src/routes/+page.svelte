@@ -8,68 +8,155 @@
 
   const demo = demoPanel as unknown as PanelDocument;
 
+  // Diegetic status rail: a live clock and session uptime, like a real sensor
+  // panel — not a web app bar.
+  let now = $state(new Date());
+  const startedAt = Date.now();
+
   onMount(() => {
     sensors.start();
+    const id = setInterval(() => (now = new Date()), 1000);
+    return () => clearInterval(id);
+  });
+
+  const clock = $derived(now.toLocaleTimeString(undefined, { hour12: false }));
+
+  const uptime = $derived.by(() => {
+    const s = Math.max(0, Math.floor((now.getTime() - startedAt) / 1000));
+    const hh = String(Math.floor(s / 3600)).padStart(2, '0');
+    const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+    const ss = String(s % 60).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
   });
 </script>
 
-<div class="page">
-  <header class="header">
-    <span class="brand">AstraGauge</span>
-    <button class="theme-toggle" type="button" onclick={() => themeStore.toggle()}>
-      {themeStore.theme === 'dark' ? 'Light' : 'Dark'} mode
-    </button>
-  </header>
+<div class="app">
+  <div class="rail">
+    <div class="rail-left">
+      <span class="mark" aria-hidden="true">✦</span>
+      <span class="panel-name">{demo.name}</span>
+    </div>
+    <div class="rail-right">
+      <span class="meta"
+        ><span class="meta-label">UP</span> <span class="ag-numeric">{uptime}</span></span
+      >
+      <span class="ag-numeric clock">{clock}</span>
+      <button
+        class="theme-toggle"
+        type="button"
+        aria-label="Toggle theme"
+        title="Toggle light / dark"
+        onclick={() => themeStore.toggle()}
+      >
+        {themeStore.theme === 'dark' ? '◐' : '◑'}
+      </button>
+    </div>
+  </div>
 
-  <main class="content">
+  <main class="surface">
     <PanelGrid panel={demo} />
   </main>
 </div>
 
 <style>
-  .page {
+  .app {
     display: flex;
     flex-direction: column;
-    min-height: 100vh;
+    height: 100vh;
+    width: 100%;
     background: var(--ag-background);
-    font-family: var(--ag-font-primary);
+    color: var(--ag-text-primary);
+    overflow: hidden;
   }
 
-  .header {
+  .rail {
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: calc(var(--ag-grid) * 1.5) calc(var(--ag-grid) * 2);
-    border-bottom: 1px solid var(--ag-border);
+    height: 34px;
+    padding: 0 calc(var(--ag-grid) * 1.5);
+    border-bottom: 1px solid var(--ag-hairline);
     background: var(--ag-surface);
+    user-select: none;
   }
 
-  .brand {
+  .rail-left,
+  .rail-right {
+    display: flex;
+    align-items: center;
+    gap: calc(var(--ag-grid) * 1.5);
+  }
+
+  .mark {
+    color: var(--ag-accent);
+    font-size: 0.8rem;
+  }
+
+  .panel-name {
     font-family: var(--ag-font-primary);
-    font-size: 1.1rem;
-    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--ag-text-secondary);
+  }
+
+  .meta {
+    font-size: 0.72rem;
+    color: var(--ag-text-secondary);
+    letter-spacing: 0.04em;
+  }
+
+  .meta-label {
+    opacity: 0.7;
+  }
+
+  .clock {
+    font-size: 0.78rem;
     color: var(--ag-text-primary);
     letter-spacing: 0.02em;
   }
 
   .theme-toggle {
-    font-family: var(--ag-font-primary);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
     font-size: 0.85rem;
-    color: var(--ag-text-primary);
-    background: var(--ag-surface-raised);
-    border: 1px solid var(--ag-border);
+    line-height: 1;
+    color: var(--ag-text-secondary);
+    background: transparent;
+    border: 1px solid var(--ag-hairline);
     border-radius: var(--ag-radius);
-    padding: calc(var(--ag-grid) * 0.75) calc(var(--ag-grid) * 1.25);
     cursor: pointer;
+    transition:
+      color 0.15s ease,
+      border-color 0.15s ease;
   }
 
   .theme-toggle:hover {
-    border-color: var(--ag-accent);
     color: var(--ag-accent);
+    border-color: var(--ag-accent-dim);
   }
 
-  .content {
-    flex: 1;
+  .surface {
+    position: relative;
+    flex: 1 1 auto;
     min-height: 0;
+    padding: calc(var(--ag-grid) * 1.5);
+    overflow: hidden;
+    /* Constellation / precision-grid motif: a faint dot field with a calm
+       glow toward the top. Restrained, not decorative noise. */
+    background-image:
+      radial-gradient(circle at 50% -10%, var(--ag-accent-dim), transparent 55%),
+      radial-gradient(var(--ag-tick) 0.5px, transparent 0.5px);
+    background-size:
+      100% 100%,
+      22px 22px;
+    background-position:
+      center top,
+      center center;
   }
 </style>
