@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::f64::consts::PI;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use astragauge_domain::{
@@ -13,12 +14,36 @@ use astragauge_domain::{
 };
 use astragauge_provider_host::{Provider, ProviderHealth, ProviderResult};
 
+/// A sine wave: `base + amplitude * sin(2*pi*(now_ms % period_ms) / period_ms)`.
+struct Wave {
+  base: f64,
+  amplitude: f64,
+  period_ms: u64,
+}
+
+/// Inclusive clamp bounds for a sensor's plausible value range.
+struct Range {
+  min: f64,
+  max: f64,
+}
+
+/// Parameters for a time-varying demo sensor: descriptor plus the wave that
+/// generates its value, clamped to the sensor's plausible range.
+struct DemoSensor {
+  descriptor: SensorDescriptor,
+  wave: Wave,
+  clamp: Range,
+}
+
 /// A mock provider for testing that returns configurable sensor data.
 pub struct MockProvider {
   descriptors: Vec<SensorDescriptor>,
   values: HashMap<SensorId, f64>,
   poll_interval: Duration,
   manifest: ProviderManifest,
+  /// When non-empty, `poll()` emits time-varying sine values from these
+  /// instead of the static `values` map.
+  demo_sensors: Vec<DemoSensor>,
 }
 
 impl MockProvider {
@@ -33,6 +58,7 @@ impl MockProvider {
       descriptors,
       values,
       poll_interval,
+      demo_sensors: Vec::new(),
     }
   }
 
@@ -60,6 +86,158 @@ impl MockProvider {
       descriptors: vec![descriptor],
       values,
       poll_interval: Duration::from_millis(10),
+      demo_sensors: Vec::new(),
+    }
+  }
+
+  /// Creates a MockProvider with a full set of time-varying demo sensors so
+  /// the default panel reads like a real system instrument cluster. Each
+  /// sensor's value follows a sine wave:
+  /// `value = clamp(base + amplitude * sin(2*pi*(now_ms % period_ms) / period_ms), clamp_min, clamp_max)`.
+  ///
+  /// Poll interval is 500ms.
+  pub fn new_demo() -> Self {
+    fn demo(
+      id: &str,
+      name: &str,
+      category: &str,
+      unit: &str,
+      wave: Wave,
+      clamp: Range,
+    ) -> DemoSensor {
+      DemoSensor {
+        descriptor: SensorDescriptor {
+          id: SensorId::new(id).expect("valid sensor id"),
+          name: name.to_string(),
+          category: category.to_string(),
+          unit: unit.to_string(),
+          device: None,
+          tags: vec![],
+        },
+        wave,
+        clamp,
+      }
+    }
+
+    let demo_sensors = vec![
+      // CPU
+      demo(
+        "cpu.total.utilization",
+        "CPU Utilization",
+        "utilization",
+        "%",
+        Wave {
+          base: 45.0,
+          amplitude: 38.0,
+          period_ms: 7000,
+        },
+        Range {
+          min: 0.0,
+          max: 100.0,
+        },
+      ),
+      demo(
+        "cpu.clock",
+        "CPU Clock",
+        "frequency",
+        "MHz",
+        Wave {
+          base: 4100.0,
+          amplitude: 700.0,
+          period_ms: 6500,
+        },
+        Range {
+          min: 800.0,
+          max: 5200.0,
+        },
+      ),
+      demo(
+        "cpu.temperature",
+        "CPU Temperature",
+        "temperature",
+        "°C",
+        Wave {
+          base: 55.0,
+          amplitude: 18.0,
+          period_ms: 11000,
+        },
+        Range {
+          min: 20.0,
+          max: 95.0,
+        },
+      ),
+      // GPU
+      demo(
+        "gpu.total.utilization",
+        "GPU Utilization",
+        "utilization",
+        "%",
+        Wave {
+          base: 40.0,
+          amplitude: 40.0,
+          period_ms: 9000,
+        },
+        Range {
+          min: 0.0,
+          max: 100.0,
+        },
+      ),
+      demo(
+        "gpu.temperature",
+        "GPU Temperature",
+        "temperature",
+        "°C",
+        Wave {
+          base: 50.0,
+          amplitude: 22.0,
+          period_ms: 13000,
+        },
+        Range {
+          min: 20.0,
+          max: 95.0,
+        },
+      ),
+      // Memory
+      demo(
+        "memory.used.percent",
+        "Memory Used",
+        "utilization",
+        "%",
+        Wave {
+          base: 60.0,
+          amplitude: 20.0,
+          period_ms: 17000,
+        },
+        Range {
+          min: 0.0,
+          max: 100.0,
+        },
+      ),
+      demo(
+        "memory.used",
+        "Memory Used",
+        "memory",
+        "MB",
+        Wave {
+          base: 19000.0,
+          amplitude: 4500.0,
+          period_ms: 17000,
+        },
+        Range {
+          min: 2048.0,
+          max: 32768.0,
+        },
+      ),
+    ];
+
+    let descriptors = demo_sensors.iter().map(|s| s.descriptor.clone()).collect();
+
+    Self {
+      manifest: create_test_manifest(),
+      descriptors,
+      values: HashMap::new(),
+      poll_interval: Duration::from_millis(500),
+      demo_sensors,
     }
   }
 }
@@ -106,6 +284,24 @@ impl Provider for MockProvider {
       .duration_since(UNIX_EPOCH)
       .map(|d| d.as_millis() as u64)
       .unwrap_or(0);
+
+    if !self.demo_sensors.is_empty() {
+      let samples: Vec<SensorSample> = self
+        .demo_sensors
+        .iter()
+        .map(|s| {
+          let phase = (timestamp_ms % s.wave.period_ms) as f64 / s.wave.period_ms as f64;
+          let value = (s.wave.base + s.wave.amplitude * (2.0 * PI * phase).sin())
+            .clamp(s.clamp.min, s.clamp.max);
+          SensorSample {
+            sensor_id: s.descriptor.id.clone(),
+            timestamp_ms,
+            value: Some(value),
+          }
+        })
+        .collect();
+      return Ok(samples);
+    }
 
     let samples: Vec<SensorSample> = self
       .values
@@ -190,6 +386,49 @@ mod tests {
     let provider = MockProvider::new_test();
     let result = provider.shutdown().await;
     assert!(result.is_ok());
+  }
+
+  #[test]
+  fn test_new_demo_has_500ms_poll_interval() {
+    let provider = MockProvider::new_demo();
+    assert_eq!(provider.poll_interval(), Duration::from_millis(500));
+  }
+
+  #[tokio::test]
+  async fn test_new_demo_discovers_full_instrument_set() {
+    let provider = MockProvider::new_demo();
+    let descriptors = provider.discover().await.unwrap();
+    assert_eq!(descriptors.len(), 7);
+
+    let ids: Vec<&str> = descriptors.iter().map(|d| d.id.as_str()).collect();
+    for expected in [
+      "cpu.total.utilization",
+      "cpu.clock",
+      "cpu.temperature",
+      "gpu.total.utilization",
+      "gpu.temperature",
+      "memory.used.percent",
+      "memory.used",
+    ] {
+      assert!(ids.contains(&expected), "missing demo sensor {expected}");
+    }
+  }
+
+  #[tokio::test]
+  async fn test_new_demo_poll_returns_samples_within_per_sensor_range() {
+    let provider = MockProvider::new_demo();
+    let samples = provider.poll().await.unwrap();
+    assert_eq!(samples.len(), 7);
+
+    // Per-sensor plausible bounds: percentages and temps stay <= 100, while
+    // clock (MHz) and memory (MB) range much higher. Assert each value is
+    // finite, positive, and within a generous instrument ceiling.
+    for sample in &samples {
+      assert!(sample.timestamp_ms > 0);
+      let value = sample.value.expect("demo sample should have a value");
+      assert!(value.is_finite() && value >= 0.0, "value {value} invalid");
+      assert!(value <= 32768.0, "value {value} above instrument ceiling");
+    }
   }
 
   #[tokio::test]

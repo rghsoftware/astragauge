@@ -12,13 +12,15 @@
   "app": {
     "windows": [
       {
-        "title": "astragauge",
-        "width": 800,
-        "height": 600
+        "title": "AstraGauge",
+        "width": 1280,
+        "height": 600,
+        "minWidth": 640,
+        "minHeight": 360
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' tauri: asset: ipc: http://ipc.localhost; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: blob: tauri:"
     }
   },
   "bundle": {

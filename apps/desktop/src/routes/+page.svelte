@@ -1,156 +1,162 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { onMount } from 'svelte';
+  import { sensors } from '$lib/data/sensors.svelte';
+  import { themeStore } from '$lib/theme/theme.svelte';
+  import PanelGrid from '$lib/panel/PanelGrid.svelte';
+  import type { PanelDocument } from '$lib/panel/types';
+  import demoPanel from '$lib/panel/demo.panel.json';
 
-  let name = $state("");
-  let greetMsg = $state("");
+  const demo = demoPanel as unknown as PanelDocument;
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
-  }
+  // Diegetic status rail: a live clock and session uptime, like a real sensor
+  // panel — not a web app bar.
+  let now = $state(new Date());
+  const startedAt = Date.now();
+
+  onMount(() => {
+    sensors.start();
+    const id = setInterval(() => (now = new Date()), 1000);
+    return () => clearInterval(id);
+  });
+
+  const clock = $derived(now.toLocaleTimeString(undefined, { hour12: false }));
+
+  const uptime = $derived.by(() => {
+    const s = Math.max(0, Math.floor((now.getTime() - startedAt) / 1000));
+    const hh = String(Math.floor(s / 3600)).padStart(2, '0');
+    const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+    const ss = String(s % 60).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  });
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
-
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
+<div class="app">
+  <div class="rail">
+    <div class="rail-left">
+      <span class="mark" aria-hidden="true">✦</span>
+      <span class="panel-name">{demo.name}</span>
+    </div>
+    <div class="rail-right">
+      <span class="meta"
+        ><span class="meta-label">UP</span> <span class="ag-numeric">{uptime}</span></span
+      >
+      <span class="ag-numeric clock">{clock}</span>
+      <button
+        class="theme-toggle"
+        type="button"
+        aria-label="Toggle theme"
+        title="Toggle light / dark"
+        onclick={() => themeStore.toggle()}
+      >
+        {themeStore.theme === 'dark' ? '◐' : '◑'}
+      </button>
+    </div>
   </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
-</main>
+  <main class="surface">
+    <PanelGrid panel={demo} />
+  </main>
+</div>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+  .app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    width: 100%;
+    background: var(--ag-background);
+    color: var(--ag-text-primary);
+    overflow: hidden;
   }
 
-  a:hover {
-    color: #24c8db;
+  .rail {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 34px;
+    padding: 0 calc(var(--ag-grid) * 1.5);
+    border-bottom: 1px solid var(--ag-hairline);
+    background: var(--ag-surface);
+    user-select: none;
   }
 
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
+  .rail-left,
+  .rail-right {
+    display: flex;
+    align-items: center;
+    gap: calc(var(--ag-grid) * 1.5);
   }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
 
+  .mark {
+    color: var(--ag-accent);
+    font-size: 0.8rem;
+  }
+
+  .panel-name {
+    font-family: var(--ag-font-primary);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--ag-text-secondary);
+  }
+
+  .meta {
+    font-size: 0.72rem;
+    color: var(--ag-text-secondary);
+    letter-spacing: 0.04em;
+  }
+
+  .meta-label {
+    opacity: 0.7;
+  }
+
+  .clock {
+    font-size: 0.78rem;
+    color: var(--ag-text-primary);
+    letter-spacing: 0.02em;
+  }
+
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    font-size: 0.85rem;
+    line-height: 1;
+    color: var(--ag-text-secondary);
+    background: transparent;
+    border: 1px solid var(--ag-hairline);
+    border-radius: var(--ag-radius);
+    cursor: pointer;
+    transition:
+      color 0.15s ease,
+      border-color 0.15s ease;
+  }
+
+  .theme-toggle:hover {
+    color: var(--ag-accent);
+    border-color: var(--ag-accent-dim);
+  }
+
+  .surface {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: calc(var(--ag-grid) * 1.5);
+    overflow: hidden;
+    /* Constellation / precision-grid motif: a faint dot field with a calm
+       glow toward the top. Restrained, not decorative noise. */
+    background-image:
+      radial-gradient(circle at 50% -10%, var(--ag-accent-dim), transparent 55%),
+      radial-gradient(var(--ag-tick) 0.5px, transparent 0.5px);
+    background-size:
+      100% 100%,
+      22px 22px;
+    background-position:
+      center top,
+      center center;
+  }
 </style>

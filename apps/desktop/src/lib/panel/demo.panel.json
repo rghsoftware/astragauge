@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "name": "System",
+  "theme": "default-dark",
+  "grid": { "columns": 12, "rowHeight": 140, "spacing": 8 },
+  "widgets": [
+    {
+      "id": "cpu_util",
+      "type": "core.gauge",
+      "x": 0,
+      "y": 0,
+      "w": 4,
+      "h": 2,
+      "props": { "label": "CPU", "min": 0, "max": 100 },
+      "bindings": { "value": "cpu.total.utilization" }
+    },
+    {
+      "id": "cpu_clock",
+      "type": "core.stat",
+      "x": 0,
+      "y": 2,
+      "w": 2,
+      "h": 1,
+      "props": { "label": "Clock", "decimals": 0 },
+      "bindings": { "value": "cpu.clock" }
+    },
+    {
+      "id": "cpu_temp",
+      "type": "core.stat",
+      "x": 2,
+      "y": 2,
+      "w": 2,
+      "h": 1,
+      "props": { "label": "CPU Temp", "thresholds": { "warn": 75, "critical": 88 } },
+      "bindings": { "value": "cpu.temperature" }
+    },
+    {
+      "id": "gpu_util",
+      "type": "core.gauge",
+      "x": 4,
+      "y": 0,
+      "w": 4,
+      "h": 2,
+      "props": { "label": "GPU", "min": 0, "max": 100 },
+      "bindings": { "value": "gpu.total.utilization" }
+    },
+    {
+      "id": "gpu_temp",
+      "type": "core.stat",
+      "x": 4,
+      "y": 2,
+      "w": 4,
+      "h": 1,
+      "props": { "label": "GPU Temp", "thresholds": { "warn": 75, "critical": 88 } },
+      "bindings": { "value": "gpu.temperature" }
+    },
+    {
+      "id": "mem_pct",
+      "type": "core.gauge",
+      "x": 8,
+      "y": 0,
+      "w": 4,
+      "h": 2,
+      "props": { "label": "Memory", "min": 0, "max": 100 },
+      "bindings": { "value": "memory.used.percent" }
+    },
+    {
+      "id": "mem_used",
+      "type": "core.stat",
+      "x": 8,
+      "y": 2,
+      "w": 4,
+      "h": 1,
+      "props": { "label": "Used", "decimals": 0 },
+      "bindings": { "value": "memory.used" }
+    }
+  ]
+}
