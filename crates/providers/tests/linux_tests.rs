@@ -135,8 +135,8 @@ mod linux_tests {
     let sensor_ids: Vec<&str> = sensors.iter().map(|s| s.id.as_str()).collect();
 
     assert!(
-      sensor_ids.contains(&"cpu.utilization"),
-      "Expected cpu.utilization sensor"
+      sensor_ids.contains(&"cpu.total.utilization"),
+      "Expected cpu.total.utilization sensor"
     );
 
     assert!(
@@ -148,8 +148,8 @@ mod linux_tests {
       "Expected memory.total sensor"
     );
     assert!(
-      sensor_ids.contains(&"memory.utilization"),
-      "Expected memory.utilization sensor"
+      sensor_ids.contains(&"memory.used.percent"),
+      "Expected memory.used.percent sensor"
     );
     assert!(
       sensor_ids.contains(&"memory.available"),
