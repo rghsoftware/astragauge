@@ -119,13 +119,15 @@ impl MockProvider {
       }
     }
 
+    use astragauge_domain::canonical;
+
     let demo_sensors = vec![
       // CPU
       demo(
-        "cpu.total.utilization",
+        canonical::CPU_UTILIZATION,
         "CPU Utilization",
         "utilization",
-        "%",
+        canonical::UNIT_PERCENT,
         Wave {
           base: 45.0,
           amplitude: 38.0,
@@ -137,10 +139,10 @@ impl MockProvider {
         },
       ),
       demo(
-        "cpu.clock",
+        canonical::CPU_CLOCK,
         "CPU Clock",
         "frequency",
-        "MHz",
+        canonical::UNIT_MHZ,
         Wave {
           base: 4100.0,
           amplitude: 700.0,
@@ -152,10 +154,10 @@ impl MockProvider {
         },
       ),
       demo(
-        "cpu.temperature",
+        canonical::CPU_TEMPERATURE,
         "CPU Temperature",
         "temperature",
-        "°C",
+        canonical::UNIT_CELSIUS,
         Wave {
           base: 55.0,
           amplitude: 18.0,
@@ -168,10 +170,10 @@ impl MockProvider {
       ),
       // GPU
       demo(
-        "gpu.total.utilization",
+        canonical::GPU_UTILIZATION,
         "GPU Utilization",
         "utilization",
-        "%",
+        canonical::UNIT_PERCENT,
         Wave {
           base: 40.0,
           amplitude: 40.0,
@@ -183,10 +185,10 @@ impl MockProvider {
         },
       ),
       demo(
-        "gpu.temperature",
+        canonical::GPU_TEMPERATURE,
         "GPU Temperature",
         "temperature",
-        "°C",
+        canonical::UNIT_CELSIUS,
         Wave {
           base: 50.0,
           amplitude: 22.0,
@@ -199,10 +201,10 @@ impl MockProvider {
       ),
       // Memory
       demo(
-        "memory.used.percent",
+        canonical::MEMORY_USED_PERCENT,
         "Memory Used",
         "utilization",
-        "%",
+        canonical::UNIT_PERCENT,
         Wave {
           base: 60.0,
           amplitude: 20.0,
@@ -214,10 +216,10 @@ impl MockProvider {
         },
       ),
       demo(
-        "memory.used",
+        canonical::MEMORY_USED,
         "Memory Used",
         "memory",
-        "MB",
+        canonical::UNIT_MB,
         Wave {
           base: 19000.0,
           amplitude: 4500.0,
@@ -401,16 +403,33 @@ mod tests {
     assert_eq!(descriptors.len(), 7);
 
     let ids: Vec<&str> = descriptors.iter().map(|d| d.id.as_str()).collect();
-    for expected in [
-      "cpu.total.utilization",
-      "cpu.clock",
-      "cpu.temperature",
-      "gpu.total.utilization",
-      "gpu.temperature",
-      "memory.used.percent",
-      "memory.used",
-    ] {
+    for expected in astragauge_domain::canonical::ALL {
       assert!(ids.contains(&expected), "missing demo sensor {expected}");
+    }
+  }
+
+  /// Verifies the demo provider emits every canonical sensor with the unit its
+  /// `ID_UNITS` entry declares — i.e. the mock honors the shared contract and
+  /// no canonical id is missing from the demo set. (The literal id/unit strings
+  /// themselves are pinned in `astragauge_domain::canonical`; asserting against
+  /// the constants here would be tautological since the mock builds from them.)
+  #[tokio::test]
+  async fn test_new_demo_units_match_canonical_contract() {
+    use astragauge_domain::canonical;
+
+    let provider = MockProvider::new_demo();
+    let descriptors = provider.discover().await.unwrap();
+
+    for (id, expected_unit) in canonical::ID_UNITS {
+      let descriptor = descriptors
+        .iter()
+        .find(|d| d.id.as_str() == id)
+        .unwrap_or_else(|| panic!("demo provider missing canonical sensor {id}"));
+      assert_eq!(
+        descriptor.unit, expected_unit,
+        "canonical sensor {id} unit drifted: expected {expected_unit:?}, got {:?}",
+        descriptor.unit
+      );
     }
   }
 

@@ -1,3 +1,4 @@
+pub mod canonical;
 pub mod panel;
 pub mod provider;
 pub mod sensor;

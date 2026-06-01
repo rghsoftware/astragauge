@@ -15,20 +15,24 @@ mod linux_canonical {
   use std::collections::HashMap;
   use std::time::Duration;
 
+  use astragauge_domain::canonical;
   use astragauge_provider_host::Provider;
   use astragauge_providers::LinuxProvider;
 
   // Canonical (id, unit) pairs that MUST match the MockProvider demo verbatim.
+  // Sourced from astragauge_domain::canonical so a drift fails at the source.
   const CANONICAL_CPU_MEM: &[(&str, &str)] = &[
-    ("cpu.total.utilization", "%"),
-    ("cpu.clock", "MHz"),
-    ("cpu.temperature", "°C"),
-    ("memory.used.percent", "%"),
-    ("memory.used", "MB"),
+    (canonical::CPU_UTILIZATION, canonical::UNIT_PERCENT),
+    (canonical::CPU_CLOCK, canonical::UNIT_MHZ),
+    (canonical::CPU_TEMPERATURE, canonical::UNIT_CELSIUS),
+    (canonical::MEMORY_USED_PERCENT, canonical::UNIT_PERCENT),
+    (canonical::MEMORY_USED, canonical::UNIT_MB),
   ];
 
-  const CANONICAL_GPU: &[(&str, &str)] =
-    &[("gpu.total.utilization", "%"), ("gpu.temperature", "°C")];
+  const CANONICAL_GPU: &[(&str, &str)] = &[
+    (canonical::GPU_UTILIZATION, canonical::UNIT_PERCENT),
+    (canonical::GPU_TEMPERATURE, canonical::UNIT_CELSIUS),
+  ];
 
   #[tokio::test]
   #[ignore]

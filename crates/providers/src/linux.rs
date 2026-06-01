@@ -27,16 +27,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use astragauge_domain::{
-  ProviderCapabilities, ProviderManifest, SensorCategories, SensorDescriptor, SensorId,
+  canonical, ProviderCapabilities, ProviderManifest, SensorCategories, SensorDescriptor, SensorId,
   SensorSample,
 };
 #[cfg(target_os = "linux")]
 use astragauge_provider_host::{Provider, ProviderHealth, ProviderResult};
 
 // ---------------------------------------------------------------------------
-// Pure parsing / selection helpers (no file IO — unit-testable on any OS / CI).
-// These are NOT gated on target_os so the CI tests on ubuntu (without
-// amdgpu/k10temp) exercise them without ever touching real /sys.
+// Pure parsing / selection helpers (no file IO — pure math on borrowed input).
+// This whole module is `#[cfg(target_os = "linux")]`, so these compile and run
+// in CI (which is Linux) without ever touching real /sys; they let the parsing
+// logic be exercised on machines lacking amdgpu/k10temp hardware.
 // ---------------------------------------------------------------------------
 
 /// Average a set of `scaling_cur_freq` readings (kHz, one per line/string) and
@@ -95,26 +96,44 @@ pub(crate) struct GpuCandidate<K> {
 /// Pick the discrete GPU: the candidate with the LARGEST mem_info_vram_total.
 /// Ties resolve to the first seen. Returns None if there are no candidates.
 pub(crate) fn pick_discrete_gpu<K: Clone>(candidates: &[GpuCandidate<K>]) -> Option<K> {
+  // Fold keeping the running best, switching only on a STRICTLY larger vram so
+  // the first-seen candidate wins ties (std's `max_by_key` would keep the last).
   candidates
     .iter()
-    .max_by_key(|c| c.vram_total)
+    .reduce(|best, c| {
+      if c.vram_total > best.vram_total {
+        c
+      } else {
+        best
+      }
+    })
     .map(|c| c.key.clone())
 }
 
-/// Compute used-memory MB and used-percent from a meminfo map of kB values.
-/// Returns `(used_mb, used_percent)`; either may be None if inputs are missing.
-pub(crate) fn meminfo_used(meminfo: &HashMap<String, u64>) -> (Option<f64>, Option<f64>) {
+/// Computed memory usage. `used_mb` and `used_percent` are always populated
+/// together (or the whole value is `None`), so the two can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MemoryUsage {
+  pub used_mb: f64,
+  pub used_percent: f64,
+}
+
+/// Compute memory usage from a meminfo map of kB values. Returns `None` if
+/// `MemTotal` is missing/zero, or if `MemAvailable` is absent — without
+/// MemAvailable, "used" cannot be computed honestly (assuming 0 available would
+/// peg the gauge at 100%), so that tick is omitted rather than reported wrong.
+pub(crate) fn meminfo_used(meminfo: &HashMap<String, u64>) -> Option<MemoryUsage> {
   let total_kb = match meminfo.get("MemTotal").copied() {
     Some(v) if v > 0 => v,
-    _ => return (None, None),
+    _ => return None,
   };
-  let avail_kb = meminfo.get("MemAvailable").copied().unwrap_or(0);
+  let avail_kb = meminfo.get("MemAvailable").copied()?;
   let used_kb = total_kb.saturating_sub(avail_kb);
 
-  // kB -> MB: /1024 (MemInfo is kB; bytes would be *1024, MB is /1024/1024).
-  let used_mb = used_kb as f64 / 1024.0;
-  let used_percent = (used_kb as f64 / total_kb as f64) * 100.0;
-  (Some(used_mb), Some(used_percent))
+  Some(MemoryUsage {
+    used_mb: used_kb as f64 / 1024.0, // kB -> MB.
+    used_percent: (used_kb as f64 / total_kb as f64) * 100.0,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -231,10 +250,10 @@ impl LinuxProvider {
     // cpu.total.utilization is always discoverable (/proc/stat always exists).
     push_descriptor(
       &mut sensors,
-      "cpu.total.utilization",
+      canonical::CPU_UTILIZATION,
       "CPU Utilization",
       "utilization",
-      "%",
+      canonical::UNIT_PERCENT,
       None,
       &["cpu"],
     );
@@ -243,10 +262,10 @@ impl LinuxProvider {
     if Self::read_cpu_clock_mhz().is_some() {
       push_descriptor(
         &mut sensors,
-        "cpu.clock",
+        canonical::CPU_CLOCK,
         "CPU Clock",
         "frequency",
-        "MHz",
+        canonical::UNIT_MHZ,
         None,
         &["cpu"],
       );
@@ -256,10 +275,10 @@ impl LinuxProvider {
     if Self::read_cpu_temperature_c().is_some() {
       push_descriptor(
         &mut sensors,
-        "cpu.temperature",
+        canonical::CPU_TEMPERATURE,
         "CPU Temperature",
         "temperature",
-        "°C",
+        canonical::UNIT_CELSIUS,
         None,
         &["cpu", "thermal"],
       );
@@ -272,7 +291,7 @@ impl LinuxProvider {
 
   fn discover_memory_sensors() -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
-    if fs::read_to_string("/proc/meminfo").is_err() {
+    if read_sys_file(Path::new("/proc/meminfo")).is_none() {
       tracing::warn!("Failed to read /proc/meminfo; memory sensors omitted");
       return sensors;
     }
@@ -280,19 +299,19 @@ impl LinuxProvider {
     // Canonical.
     push_descriptor(
       &mut sensors,
-      "memory.used.percent",
+      canonical::MEMORY_USED_PERCENT,
       "Memory Used",
       "utilization",
-      "%",
+      canonical::UNIT_PERCENT,
       None,
       &["memory"],
     );
     push_descriptor(
       &mut sensors,
-      "memory.used",
+      canonical::MEMORY_USED,
       "Memory Used",
       "memory",
-      "MB",
+      canonical::UNIT_MB,
       None,
       &["memory"],
     );
@@ -303,7 +322,7 @@ impl LinuxProvider {
       "memory.total",
       "Memory Total",
       "memory",
-      "MB",
+      canonical::UNIT_MB,
       None,
       &["memory"],
     );
@@ -312,7 +331,7 @@ impl LinuxProvider {
       "memory.available",
       "Memory Available",
       "memory",
-      "MB",
+      canonical::UNIT_MB,
       None,
       &["memory"],
     );
@@ -323,26 +342,20 @@ impl LinuxProvider {
   // --- Temperature descriptors (canonical cpu.temperature handled above) ------
 
   /// Discover granular per-hwmon temperature sensors as best-effort extras.
-  /// The canonical cpu.temperature / gpu.temperature are emitted elsewhere; the
-  /// extras here use device-qualified ids and never collide with the canonical 7.
+  /// The canonical cpu.temperature / gpu.temperature are emitted elsewhere.
+  /// `make_temp_sensor_id` always produces device-qualified ids of 3-4 segments
+  /// (e.g. `cpu.k10temp.temp1.temperature`), so these structurally cannot equal
+  /// the 2-segment canonical ids and never collide with the canonical 7.
   fn discover_temperature_sensors() -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
     let hwmon_path = Path::new("/sys/class/hwmon");
-    if !hwmon_path.exists() {
+    let Some(entries) = read_sys_dir(hwmon_path) else {
       return sensors;
-    }
-
-    let entries = match fs::read_dir(hwmon_path) {
-      Ok(e) => e,
-      Err(e) => {
-        tracing::warn!("Failed to read {}: {}", hwmon_path.display(), e);
-        return sensors;
-      }
     };
 
     for entry in entries.flatten() {
       let hwmon_dir = entry.path();
-      let device_name = fs::read_to_string(hwmon_dir.join("name"))
+      let device_name = read_sys_file(&hwmon_dir.join("name"))
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
       if device_name.is_empty() {
@@ -351,12 +364,7 @@ impl LinuxProvider {
 
       for (index, _label) in Self::temp_inputs(&hwmon_dir) {
         let id = make_temp_sensor_id(&device_name, &index);
-        // Only valid (and non-canonical) ids survive; collisions/invalid ids are skipped.
-        if id == "cpu.temperature" || id == "gpu.temperature" {
-          continue;
-        }
-        let label = fs::read_to_string(hwmon_dir.join(format!("temp{}_label", index)))
-          .ok()
+        let label = read_sys_file(&hwmon_dir.join(format!("temp{}_label", index)))
           .map(|s| s.trim().to_string())
           .filter(|s| !s.is_empty());
         let display = label.unwrap_or_else(|| format!("{} temp{}", device_name, index));
@@ -365,7 +373,7 @@ impl LinuxProvider {
           id,
           display,
           "temperature".to_string(),
-          "°C".to_string(),
+          canonical::UNIT_CELSIUS.to_string(),
           Some(device_name.clone()),
           vec!["thermal".to_string(), device_name.clone()],
         );
@@ -386,10 +394,10 @@ impl LinuxProvider {
     if Self::read_gpu_busy_percent(card).is_some() {
       push_descriptor(
         &mut sensors,
-        "gpu.total.utilization",
+        canonical::GPU_UTILIZATION,
         "GPU Utilization",
         "utilization",
-        "%",
+        canonical::UNIT_PERCENT,
         Some("gpu".to_string()),
         &["gpu"],
       );
@@ -397,10 +405,10 @@ impl LinuxProvider {
     if Self::read_gpu_temperature_c(card).is_some() {
       push_descriptor(
         &mut sensors,
-        "gpu.temperature",
+        canonical::GPU_TEMPERATURE,
         "GPU Temperature",
         "temperature",
-        "°C",
+        canonical::UNIT_CELSIUS,
         Some("gpu".to_string()),
         &["gpu", "thermal"],
       );
@@ -416,7 +424,7 @@ impl LinuxProvider {
   // ------------------------------------------------------------------------
   fn find_discrete_gpu() -> Option<PathBuf> {
     let drm = Path::new("/sys/class/drm");
-    let entries = fs::read_dir(drm).ok()?;
+    let entries = read_sys_dir(drm)?;
 
     let mut candidates: Vec<GpuCandidate<PathBuf>> = Vec::new();
     for entry in entries.flatten() {
@@ -424,13 +432,10 @@ impl LinuxProvider {
       let busy = device.join("gpu_busy_percent");
       let vram = device.join("mem_info_vram_total");
 
-      let busy_ok = fs::read_to_string(&busy)
-        .ok()
+      let busy_ok = read_sys_file(&busy)
         .and_then(|s| s.trim().parse::<f64>().ok())
         .is_some();
-      let vram_total = fs::read_to_string(&vram)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok());
+      let vram_total = read_sys_file(&vram).and_then(|s| s.trim().parse::<u64>().ok());
 
       if let (true, Some(vram_total)) = (busy_ok, vram_total) {
         candidates.push(GpuCandidate {
@@ -457,7 +462,7 @@ impl LinuxProvider {
 
   /// Parse /proc/stat first line (aggregate CPU stats).
   fn read_cpu_stats() -> Option<CpuStats> {
-    let content = fs::read_to_string("/proc/stat").ok()?;
+    let content = read_sys_file(Path::new("/proc/stat"))?;
     let first_line = content.lines().next()?;
 
     let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -487,7 +492,7 @@ impl LinuxProvider {
   /// Fallback: mean of "cpu MHz" lines in /proc/cpuinfo.
   fn read_cpu_clock_mhz() -> Option<f64> {
     let mut freqs: Vec<String> = Vec::new();
-    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
+    if let Some(entries) = read_sys_dir(Path::new("/sys/devices/system/cpu")) {
       for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -499,7 +504,7 @@ impl LinuxProvider {
           continue;
         }
         let path = entry.path().join("cpufreq/scaling_cur_freq");
-        if let Ok(content) = fs::read_to_string(&path) {
+        if let Some(content) = read_sys_file(&path) {
           freqs.push(content);
         }
       }
@@ -510,7 +515,7 @@ impl LinuxProvider {
     }
 
     // Fallback to /proc/cpuinfo.
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
+    let cpuinfo = read_sys_file(Path::new("/proc/cpuinfo"))?;
     mean_cpuinfo_mhz(&cpuinfo)
   }
 
@@ -519,13 +524,13 @@ impl LinuxProvider {
   /// k10temp/coretemp/zenpower.
   fn read_cpu_temperature_c() -> Option<f64> {
     let hwmon_path = Path::new("/sys/class/hwmon");
-    let entries = fs::read_dir(hwmon_path).ok()?;
+    let entries = read_sys_dir(hwmon_path)?;
 
     let mut fallback: Option<f64> = None;
 
     for entry in entries.flatten() {
       let dir = entry.path();
-      let device_name = fs::read_to_string(dir.join("name"))
+      let device_name = read_sys_file(&dir.join("name"))
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
 
@@ -557,8 +562,7 @@ impl LinuxProvider {
 
   /// Read the discrete GPU's busy percent from card/device/gpu_busy_percent.
   fn read_gpu_busy_percent(card_device: &Path) -> Option<f64> {
-    fs::read_to_string(card_device.join("gpu_busy_percent"))
-      .ok()?
+    read_sys_file(&card_device.join("gpu_busy_percent"))?
       .trim()
       .parse::<f64>()
       .ok()
@@ -569,7 +573,7 @@ impl LinuxProvider {
   /// card/device/hwmon/hwmon*/tempK_input where label=="edge", else temp1.
   fn read_gpu_temperature_c(card_device: &Path) -> Option<f64> {
     let hwmon_root = card_device.join("hwmon");
-    let entries = fs::read_dir(&hwmon_root).ok()?;
+    let entries = read_sys_dir(&hwmon_root)?;
 
     for entry in entries.flatten() {
       let dir = entry.path();
@@ -599,7 +603,7 @@ impl LinuxProvider {
   /// when no tempN_label file exists.
   fn temp_inputs(dir: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Some(entries) = read_sys_dir(dir) else {
       return out;
     };
     for entry in entries.flatten() {
@@ -616,7 +620,7 @@ impl LinuxProvider {
       if index.is_empty() {
         continue;
       }
-      let label = fs::read_to_string(dir.join(format!("temp{}_label", index)))
+      let label = read_sys_file(&dir.join(format!("temp{}_label", index)))
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
       out.push((index, label));
@@ -626,13 +630,13 @@ impl LinuxProvider {
 
   /// Read tempN_input from a hwmon dir and convert millidegrees -> °C.
   fn read_temp_input_c(dir: &Path, index: &str) -> Option<f64> {
-    let raw = fs::read_to_string(dir.join(format!("temp{}_input", index))).ok()?;
+    let raw = read_sys_file(&dir.join(format!("temp{}_input", index)))?;
     millidegrees_to_celsius(&raw)
   }
 
   /// Parse /proc/meminfo into a map of kB values (raw kB, not bytes).
   fn read_meminfo_kb() -> Option<HashMap<String, u64>> {
-    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    let content = read_sys_file(Path::new("/proc/meminfo"))?;
     let mut meminfo = HashMap::new();
     for line in content.lines() {
       let parts: Vec<&str> = line.split_whitespace().collect();
@@ -657,7 +661,12 @@ impl LinuxProvider {
         let mut prev_guard = self.prev_cpu_stats.lock().unwrap();
         if let Some(prev_stats) = prev_guard.as_ref() {
           if let Some(util) = CpuStats::utilization_from(*prev_stats, current_stats) {
-            push_sample(samples, "cpu.total.utilization", timestamp_ms, Some(util));
+            push_sample(
+              samples,
+              canonical::CPU_UTILIZATION,
+              timestamp_ms,
+              Some(util),
+            );
           }
         }
         *prev_guard = Some(current_stats);
@@ -667,12 +676,12 @@ impl LinuxProvider {
 
     // Clock.
     if let Some(mhz) = Self::read_cpu_clock_mhz() {
-      push_sample(samples, "cpu.clock", timestamp_ms, Some(mhz));
+      push_sample(samples, canonical::CPU_CLOCK, timestamp_ms, Some(mhz));
     }
 
     // Temperature.
     if let Some(c) = Self::read_cpu_temperature_c() {
-      push_sample(samples, "cpu.temperature", timestamp_ms, Some(c));
+      push_sample(samples, canonical::CPU_TEMPERATURE, timestamp_ms, Some(c));
     }
   }
 
@@ -685,9 +694,25 @@ impl LinuxProvider {
       }
     };
 
-    let (used_mb, used_percent) = meminfo_used(&meminfo);
-    push_sample(samples, "memory.used.percent", timestamp_ms, used_percent);
-    push_sample(samples, "memory.used", timestamp_ms, used_mb);
+    match meminfo_used(&meminfo) {
+      Some(usage) => {
+        push_sample(
+          samples,
+          canonical::MEMORY_USED_PERCENT,
+          timestamp_ms,
+          Some(usage.used_percent),
+        );
+        push_sample(
+          samples,
+          canonical::MEMORY_USED,
+          timestamp_ms,
+          Some(usage.used_mb),
+        );
+      }
+      None => {
+        tracing::warn!("meminfo missing MemTotal/MemAvailable; memory.used* omitted this tick")
+      }
+    }
 
     // Extras in MB.
     if let Some(total_kb) = meminfo.get("MemTotal").copied() {
@@ -710,22 +735,16 @@ impl LinuxProvider {
 
   fn poll_temperatures(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
     // Canonical cpu.temperature is emitted by poll_cpu. Here we emit only the
-    // granular per-hwmon extras (skipping any that would collide with canonical).
+    // granular per-hwmon extras; their device-qualified ids (3-4 segments) can
+    // never equal the 2-segment canonical ids, so there is no collision to guard.
     let hwmon_path = Path::new("/sys/class/hwmon");
-    if !hwmon_path.exists() {
+    let Some(entries) = read_sys_dir(hwmon_path) else {
       return;
-    }
-    let entries = match fs::read_dir(hwmon_path) {
-      Ok(e) => e,
-      Err(e) => {
-        tracing::warn!("Failed to read hwmon directory: {}", e);
-        return;
-      }
     };
 
     for entry in entries.flatten() {
       let dir = entry.path();
-      let device_name = fs::read_to_string(dir.join("name"))
+      let device_name = read_sys_file(&dir.join("name"))
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
       if device_name.is_empty() {
@@ -734,9 +753,6 @@ impl LinuxProvider {
 
       for (index, _label) in Self::temp_inputs(&dir) {
         let id = make_temp_sensor_id(&device_name, &index);
-        if id == "cpu.temperature" || id == "gpu.temperature" {
-          continue;
-        }
         if let Some(c) = Self::read_temp_input_c(&dir, &index) {
           push_sample_owned(samples, id, timestamp_ms, Some(c));
         }
@@ -749,10 +765,15 @@ impl LinuxProvider {
       return;
     };
     if let Some(busy) = Self::read_gpu_busy_percent(card) {
-      push_sample(samples, "gpu.total.utilization", timestamp_ms, Some(busy));
+      push_sample(
+        samples,
+        canonical::GPU_UTILIZATION,
+        timestamp_ms,
+        Some(busy),
+      );
     }
     if let Some(c) = Self::read_gpu_temperature_c(card) {
-      push_sample(samples, "gpu.temperature", timestamp_ms, Some(c));
+      push_sample(samples, canonical::GPU_TEMPERATURE, timestamp_ms, Some(c));
     }
   }
 }
@@ -760,6 +781,42 @@ impl LinuxProvider {
 // ---------------------------------------------------------------------------
 // Small free helpers shared by discover/poll (keep IDs / units in one place).
 // ---------------------------------------------------------------------------
+
+/// Read a /proc or /sys file, treating absence (`NotFound`) as an expected,
+/// silent `None` — most sensors are simply not present on a given machine — but
+/// logging any *other* I/O error (permission denied, I/O failure, device
+/// removed) with the path. This makes the module's "missing source is skipped
+/// and logged" contract true: expected absence stays quiet, genuine failures
+/// are surfaced and diagnosable instead of vanishing into a bare `.ok()`.
+#[cfg(target_os = "linux")]
+fn read_sys_file(path: &Path) -> Option<String> {
+  match fs::read_to_string(path) {
+    Ok(s) => Some(s),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    Err(e) => {
+      tracing::warn!("Unexpected error reading {}: {}", path.display(), e);
+      None
+    }
+  }
+}
+
+/// Directory counterpart to [`read_sys_file`]: `NotFound` is a silent `None`
+/// (the subsystem isn't present), any other error is logged with the path.
+#[cfg(target_os = "linux")]
+fn read_sys_dir(path: &Path) -> Option<fs::ReadDir> {
+  match fs::read_dir(path) {
+    Ok(d) => Some(d),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    Err(e) => {
+      tracing::warn!(
+        "Unexpected error reading directory {}: {}",
+        path.display(),
+        e
+      );
+      None
+    }
+  }
+}
 
 /// Build a device-qualified id for a granular per-hwmon temp extra.
 /// Returns an empty string for names that cannot form a valid id; the caller
@@ -943,6 +1000,15 @@ mod tests {
   }
 
   #[test]
+  fn mean_freq_skips_unparseable_samples() {
+    // One CPU's scaling_cur_freq is unreadable/garbage: it must be excluded from
+    // BOTH the sum and the count, so the mean is over the valid samples only.
+    let mixed = ["5000000", "garbage", ""];
+    let mhz = mean_freq_mhz_from_khz(&mixed).expect("should compute from the valid sample");
+    assert!((mhz - 5000.0).abs() < f64::EPSILON, "got {}", mhz);
+  }
+
+  #[test]
   fn cpuinfo_mhz_fallback_averages() {
     let cpuinfo = "processor\t: 0\ncpu MHz\t\t: 4000.000\nprocessor\t: 1\ncpu MHz\t\t: 4200.000\n";
     let mhz = mean_cpuinfo_mhz(cpuinfo).expect("should compute");
@@ -950,10 +1016,18 @@ mod tests {
   }
 
   #[test]
+  fn cpuinfo_mhz_no_match_is_none() {
+    // A cpuinfo with no "cpu MHz" lines triggers the fallback-of-the-fallback.
+    assert!(mean_cpuinfo_mhz("processor\t: 0\nvendor_id\t: AuthenticAMD\n").is_none());
+  }
+
+  #[test]
   fn millidegrees_converts() {
     assert!((millidegrees_to_celsius("50125").unwrap() - 50.125).abs() < f64::EPSILON);
     assert!((millidegrees_to_celsius("  48000\n").unwrap() - 48.0).abs() < f64::EPSILON);
     assert!(millidegrees_to_celsius("notanumber").is_none());
+    // Some sensors legitimately report sub-zero readings; conversion is signed.
+    assert!((millidegrees_to_celsius("-5000").unwrap() + 5.0).abs() < f64::EPSILON);
   }
 
   #[test]
@@ -978,31 +1052,62 @@ mod tests {
   }
 
   #[test]
+  fn pick_discrete_gpu_tie_resolves_to_first_seen() {
+    // Equal VRAM: the FIRST candidate wins (contract in the doc comment).
+    let candidates = vec![
+      GpuCandidate {
+        key: "card0",
+        vram_total: 17_095_983_104,
+      },
+      GpuCandidate {
+        key: "card1",
+        vram_total: 17_095_983_104,
+      },
+    ];
+    assert_eq!(pick_discrete_gpu(&candidates), Some("card0"));
+  }
+
+  #[test]
   fn meminfo_used_computes_mb_and_percent() {
     let mut m = HashMap::new();
     m.insert("MemTotal".to_string(), 63_307_136u64); // kB
     m.insert("MemAvailable".to_string(), 21_401_844u64); // kB
-    let (used_mb, used_pct) = meminfo_used(&m);
+    let usage = meminfo_used(&m).expect("should compute");
     // used kB = 41_905_292 -> /1024 = 40923.14 MB
     assert!(
-      (used_mb.unwrap() - 40923.14).abs() < 1.0,
-      "mb={:?}",
-      used_mb
+      (usage.used_mb - 40923.14).abs() < 1.0,
+      "mb={}",
+      usage.used_mb
     );
     // percent = 41_905_292 / 63_307_136 * 100 = 66.19%
     assert!(
-      (used_pct.unwrap() - 66.19).abs() < 0.5,
-      "pct={:?}",
-      used_pct
+      (usage.used_percent - 66.19).abs() < 0.5,
+      "pct={}",
+      usage.used_percent
     );
   }
 
   #[test]
   fn meminfo_used_missing_total_is_none() {
     let m = HashMap::new();
-    let (used_mb, used_pct) = meminfo_used(&m);
-    assert!(used_mb.is_none());
-    assert!(used_pct.is_none());
+    assert!(meminfo_used(&m).is_none());
+  }
+
+  #[test]
+  fn meminfo_used_missing_available_is_none() {
+    // Without MemAvailable we can't compute "used" honestly; rather than peg the
+    // gauge at 100% (used == total), the helper omits the reading entirely.
+    let mut m = HashMap::new();
+    m.insert("MemTotal".to_string(), 63_307_136u64);
+    assert!(meminfo_used(&m).is_none());
+  }
+
+  #[test]
+  fn meminfo_used_zero_total_is_none() {
+    let mut m = HashMap::new();
+    m.insert("MemTotal".to_string(), 0u64);
+    m.insert("MemAvailable".to_string(), 0u64);
+    assert!(meminfo_used(&m).is_none());
   }
 
   #[test]
@@ -1015,14 +1120,20 @@ mod tests {
       make_temp_sensor_id("amdgpu", "1"),
       "gpu.amdgpu.temp1.temperature"
     );
-    // Non-alphanumerics stripped so the id stays valid for SensorId.
+    // Non-alphanumerics stripped AND the result must be a valid SensorId (not
+    // just valid characters): the caller relies on SensorId::new accepting it.
     let id = make_temp_sensor_id("r8169_0_800:00", "1");
-    assert!(
-      id.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.'),
-      "id had invalid chars: {}",
-      id
-    );
+    SensorId::new(&id)
+      .unwrap_or_else(|e| panic!("sanitized id {id:?} is not a valid SensorId: {e}"));
+  }
+
+  #[test]
+  fn make_temp_id_unsanitizable_name_is_empty() {
+    // A name with no [a-z0-9] survivors yields "", which SensorId::new rejects,
+    // so the caller skips it. Pin both halves of that contract.
+    let id = make_temp_sensor_id("_:-", "1");
+    assert_eq!(id, "");
+    assert!(SensorId::new(&id).is_err());
   }
 
   #[cfg(target_os = "linux")]
