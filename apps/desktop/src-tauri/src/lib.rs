@@ -44,7 +44,10 @@ async fn build_snapshot(store: &SensorStore) -> Vec<SensorReading> {
         timestamp_ms,
       });
     } else {
-      tracing::warn!("Sensor {:?} has no descriptor; omitting from snapshot", sensor_id);
+      tracing::warn!(
+        "Sensor {:?} has no descriptor; omitting from snapshot",
+        sensor_id
+      );
     }
   }
 
@@ -105,6 +108,99 @@ async fn list_available_sensors(
   Ok(sensors)
 }
 
+/// Builds the demo MockProvider, which emits the canonical sensor ids the
+/// default panel binds to (so the UI stays populated even as a fallback).
+fn make_mock_provider() -> Arc<Box<dyn astragauge_provider_host::Provider>> {
+  Arc::new(Box::new(MockProvider::new_demo()))
+}
+
+/// Selects the sensor provider based on the `ASTRAGAUGE_PROVIDER` env var.
+///
+/// Values: `auto` (default) | `mock` | `linux`.
+/// - `auto`: on Linux, use LinuxProvider unless it discovers 0 sensors, in
+///   which case fall back to the demo MockProvider. On non-Linux, use mock.
+/// - `mock`: always the demo MockProvider.
+/// - `linux`: force LinuxProvider on Linux; on non-Linux, warn and use mock.
+///
+/// Returns the chosen provider plus a human-readable reason for logging.
+/// Every reference to `LinuxProvider` is `#[cfg(target_os = "linux")]`-gated
+/// so the app still compiles on macOS/Windows.
+fn select_provider() -> (Arc<Box<dyn astragauge_provider_host::Provider>>, String) {
+  let requested = std::env::var("ASTRAGAUGE_PROVIDER").unwrap_or_default();
+  let mode = requested.trim().to_ascii_lowercase();
+
+  match mode.as_str() {
+    "mock" => (
+      make_mock_provider(),
+      "MockProvider (demo): ASTRAGAUGE_PROVIDER=mock".to_string(),
+    ),
+    "linux" => {
+      #[cfg(target_os = "linux")]
+      {
+        let provider = astragauge_providers::LinuxProvider::new();
+        (
+          Arc::new(Box::new(provider)),
+          "LinuxProvider: ASTRAGAUGE_PROVIDER=linux (forced)".to_string(),
+        )
+      }
+      #[cfg(not(target_os = "linux"))]
+      {
+        tracing::warn!(
+          "ASTRAGAUGE_PROVIDER=linux requested on a non-Linux platform; \
+           LinuxProvider is unavailable, using demo MockProvider instead"
+        );
+        (
+          make_mock_provider(),
+          "MockProvider (demo): ASTRAGAUGE_PROVIDER=linux requested on non-Linux platform"
+            .to_string(),
+        )
+      }
+    }
+    // "auto", empty, or any unrecognized value -> auto behavior.
+    other => {
+      if !other.is_empty() && other != "auto" {
+        tracing::warn!(
+          "Unrecognized ASTRAGAUGE_PROVIDER={:?}; defaulting to auto selection",
+          other
+        );
+      }
+
+      #[cfg(target_os = "linux")]
+      {
+        let provider = astragauge_providers::LinuxProvider::new();
+        // discover() returns the eagerly-discovered descriptors; a clone of a
+        // Vec, so this resolves immediately on Tauri's global runtime.
+        let sensor_count =
+          tauri::async_runtime::block_on(astragauge_provider_host::Provider::discover(&provider))
+            .map(|sensors| sensors.len())
+            .unwrap_or(0);
+
+        if sensor_count > 0 {
+          (
+            Arc::new(Box::new(provider)),
+            format!(
+              "LinuxProvider: auto selected ({} sensors discovered)",
+              sensor_count
+            ),
+          )
+        } else {
+          (
+            make_mock_provider(),
+            "MockProvider (demo): auto fallback — LinuxProvider discovered 0 sensors".to_string(),
+          )
+        }
+      }
+      #[cfg(not(target_os = "linux"))]
+      {
+        (
+          make_mock_provider(),
+          "MockProvider (demo): auto selection on non-Linux platform".to_string(),
+        )
+      }
+    }
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let store = Arc::new(SensorStore::new());
@@ -112,14 +208,13 @@ pub fn run() {
   let config = HostConfig::default();
   let host = Arc::new(std::sync::RwLock::new(ProviderHost::new(config, store)));
 
-  let mock_provider = MockProvider::new_demo();
-  let mock_provider_arc: Arc<Box<dyn astragauge_provider_host::Provider>> =
-    Arc::new(Box::new(mock_provider));
+  let (provider, reason) = select_provider();
+  tracing::info!("Selected sensor provider: {}", reason);
   host
     .write()
     .expect("Provider host lock should not be poisoned at startup")
-    .register_provider(mock_provider_arc)
-    .expect("Failed to register MockProvider");
+    .register_provider(provider)
+    .expect("Failed to register selected provider");
 
   let host_clone = Arc::clone(&host);
   let store_for_emitter = Arc::clone(&store_clone);
