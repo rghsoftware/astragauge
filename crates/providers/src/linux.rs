@@ -1,4 +1,16 @@
-//! Linux system provider - reads from /proc, /sys/class/hwmon for CPU, memory, and temperature sensors.
+//! Linux system provider - reads from /proc and /sys for CPU, GPU, memory, and
+//! temperature sensors.
+//!
+//! Emits the 7 canonical sensor ids the default instrument panel binds to:
+//!   cpu.total.utilization, cpu.clock, cpu.temperature,
+//!   gpu.total.utilization, gpu.temperature,
+//!   memory.used.percent, memory.used
+//! plus a handful of best-effort extras (memory.total, memory.available, and
+//! granular per-hwmon temperatures). Unit strings match the MockProvider demo
+//! exactly so the LinuxProvider is interchangeable with the mock.
+//!
+//! Reads only /proc and /sys (no external binaries). A missing sensor source is
+//! skipped and logged, never panicked on.
 
 #[cfg(target_os = "linux")]
 use async_trait::async_trait;
@@ -7,7 +19,7 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
@@ -15,11 +27,118 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use astragauge_domain::{
-  ProviderCapabilities, ProviderManifest, SensorCategories, SensorDescriptor, SensorId,
+  canonical, ProviderCapabilities, ProviderManifest, SensorCategories, SensorDescriptor, SensorId,
   SensorSample,
 };
 #[cfg(target_os = "linux")]
 use astragauge_provider_host::{Provider, ProviderHealth, ProviderResult};
+
+// ---------------------------------------------------------------------------
+// Pure parsing / selection helpers (no file IO — pure math on borrowed input).
+// This whole module is `#[cfg(target_os = "linux")]`, so these compile and run
+// in CI (which is Linux) without ever touching real /sys; they let the parsing
+// logic be exercised on machines lacking amdgpu/k10temp hardware.
+// ---------------------------------------------------------------------------
+
+/// Average a set of `scaling_cur_freq` readings (kHz, one per line/string) and
+/// convert to MHz. Returns None if no value parses.
+pub(crate) fn mean_freq_mhz_from_khz<S: AsRef<str>>(samples: &[S]) -> Option<f64> {
+  let mut sum_khz: f64 = 0.0;
+  let mut count: u64 = 0;
+  for s in samples {
+    if let Ok(khz) = s.as_ref().trim().parse::<f64>() {
+      sum_khz += khz;
+      count += 1;
+    }
+  }
+  if count == 0 {
+    return None;
+  }
+  Some((sum_khz / count as f64) / 1000.0)
+}
+
+/// Average the "cpu MHz" lines of /proc/cpuinfo (already in MHz). Fallback for
+/// machines without cpufreq. Returns None if no value parses.
+pub(crate) fn mean_cpuinfo_mhz(cpuinfo: &str) -> Option<f64> {
+  let mut sum: f64 = 0.0;
+  let mut count: u64 = 0;
+  for line in cpuinfo.lines() {
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("cpu mhz") {
+      if let Some((_, val)) = line.split_once(':') {
+        if let Ok(mhz) = val.trim().parse::<f64>() {
+          sum += mhz;
+          count += 1;
+        }
+      }
+    }
+  }
+  if count == 0 {
+    return None;
+  }
+  Some(sum / count as f64)
+}
+
+/// Convert a millidegree-Celsius reading (e.g. "50125") to Celsius.
+pub(crate) fn millidegrees_to_celsius(raw: &str) -> Option<f64> {
+  raw.trim().parse::<i64>().ok().map(|mc| mc as f64 / 1000.0)
+}
+
+/// A discrete-GPU candidate: a drm card with readable gpu_busy_percent AND
+/// mem_info_vram_total. `key` is anything that identifies the card to the
+/// caller (e.g. its device path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GpuCandidate<K> {
+  pub key: K,
+  pub vram_total: u64,
+}
+
+/// Pick the discrete GPU: the candidate with the LARGEST mem_info_vram_total.
+/// Ties resolve to the first seen. Returns None if there are no candidates.
+pub(crate) fn pick_discrete_gpu<K: Clone>(candidates: &[GpuCandidate<K>]) -> Option<K> {
+  // Fold keeping the running best, switching only on a STRICTLY larger vram so
+  // the first-seen candidate wins ties (std's `max_by_key` would keep the last).
+  candidates
+    .iter()
+    .reduce(|best, c| {
+      if c.vram_total > best.vram_total {
+        c
+      } else {
+        best
+      }
+    })
+    .map(|c| c.key.clone())
+}
+
+/// Computed memory usage. `used_mb` and `used_percent` are always populated
+/// together (or the whole value is `None`), so the two can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MemoryUsage {
+  pub used_mb: f64,
+  pub used_percent: f64,
+}
+
+/// Compute memory usage from a meminfo map of kB values. Returns `None` if
+/// `MemTotal` is missing/zero, or if `MemAvailable` is absent — without
+/// MemAvailable, "used" cannot be computed honestly (assuming 0 available would
+/// peg the gauge at 100%), so that tick is omitted rather than reported wrong.
+pub(crate) fn meminfo_used(meminfo: &HashMap<String, u64>) -> Option<MemoryUsage> {
+  let total_kb = match meminfo.get("MemTotal").copied() {
+    Some(v) if v > 0 => v,
+    _ => return None,
+  };
+  let avail_kb = meminfo.get("MemAvailable").copied()?;
+  let used_kb = total_kb.saturating_sub(avail_kb);
+
+  Some(MemoryUsage {
+    used_mb: used_kb as f64 / 1024.0, // kB -> MB.
+    used_percent: (used_kb as f64 / total_kb as f64) * 100.0,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// CPU utilization stats (/proc/stat).
+// ---------------------------------------------------------------------------
 
 /// CPU statistics from /proc/stat for utilization calculation.
 /// Stores cumulative time values in jiffies (typically 1/100 second).
@@ -87,6 +206,9 @@ pub struct LinuxProvider {
   /// Previous CPU stats for utilization delta calculation.
   /// Uses Arc<Mutex> for interior mutability since poll() takes &self.
   prev_cpu_stats: Arc<Mutex<Option<CpuStats>>>,
+  /// device path of the discrete GPU, chosen once at construction so discover()
+  /// and poll() stay in lockstep. None if no discrete GPU candidate exists.
+  discrete_gpu: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -94,212 +216,241 @@ impl LinuxProvider {
   #[allow(clippy::new_without_default)]
   pub fn new() -> Self {
     tracing::info!("Initializing Linux provider");
-    let sensors = Self::discover_sensors();
+    let discrete_gpu = Self::find_discrete_gpu();
+    match &discrete_gpu {
+      Some(p) => tracing::info!("Selected discrete GPU: {}", p.display()),
+      None => tracing::info!("No discrete GPU detected; gpu.* sensors omitted"),
+    }
+    let sensors = Self::discover_sensors(discrete_gpu.as_deref());
     tracing::info!("Linux provider discovered {} sensors", sensors.len());
     Self {
       manifest: linux_manifest(),
       sensors,
       prev_cpu_stats: Arc::new(Mutex::new(None)),
+      discrete_gpu,
     }
   }
 
-  fn discover_sensors() -> Vec<SensorDescriptor> {
+  fn discover_sensors(discrete_gpu: Option<&Path>) -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
 
-    match Self::discover_cpu_sensors() {
-      Ok(cpu_sensors) => {
-        tracing::debug!("Discovered {} CPU sensors", cpu_sensors.len());
-        sensors.extend(cpu_sensors);
-      }
-      Err(e) => {
-        tracing::warn!("Failed to discover CPU sensors: {}", e);
-      }
+    sensors.extend(Self::discover_cpu_sensors());
+    sensors.extend(Self::discover_memory_sensors());
+    sensors.extend(Self::discover_temperature_sensors());
+    sensors.extend(Self::discover_gpu_sensors(discrete_gpu));
+
+    sensors
+  }
+
+  // --- CPU descriptors --------------------------------------------------------
+
+  fn discover_cpu_sensors() -> Vec<SensorDescriptor> {
+    let mut sensors = Vec::new();
+
+    // cpu.total.utilization is always discoverable (/proc/stat always exists).
+    push_descriptor(
+      &mut sensors,
+      canonical::CPU_UTILIZATION,
+      "CPU Utilization",
+      "utilization",
+      canonical::UNIT_PERCENT,
+      None,
+      &["cpu"],
+    );
+
+    // cpu.clock — only if we can read a frequency from cpufreq or cpuinfo.
+    if Self::read_cpu_clock_mhz().is_some() {
+      push_descriptor(
+        &mut sensors,
+        canonical::CPU_CLOCK,
+        "CPU Clock",
+        "frequency",
+        canonical::UNIT_MHZ,
+        None,
+        &["cpu"],
+      );
     }
 
-    match Self::discover_memory_sensors() {
-      Ok(mem_sensors) => {
-        tracing::debug!("Discovered {} memory sensors", mem_sensors.len());
-        sensors.extend(mem_sensors);
-      }
-      Err(e) => {
-        tracing::warn!("Failed to discover memory sensors: {}", e);
-      }
-    }
-
-    match Self::discover_hwmon_sensors() {
-      Ok(hwmon_sensors) => {
-        tracing::debug!(
-          "Discovered {} hwmon temperature sensors",
-          hwmon_sensors.len()
-        );
-        sensors.extend(hwmon_sensors);
-      }
-      Err(e) => {
-        tracing::warn!("Failed to discover hwmon sensors: {}", e);
-      }
+    // cpu.temperature — only if we can locate a CPU package temperature.
+    if Self::read_cpu_temperature_c().is_some() {
+      push_descriptor(
+        &mut sensors,
+        canonical::CPU_TEMPERATURE,
+        "CPU Temperature",
+        "temperature",
+        canonical::UNIT_CELSIUS,
+        None,
+        &["cpu", "thermal"],
+      );
     }
 
     sensors
   }
 
-  fn discover_cpu_sensors() -> std::io::Result<Vec<SensorDescriptor>> {
-    let _content = fs::read_to_string("/proc/cpuinfo")?;
-    let mut sensors = Vec::new();
+  // --- Memory descriptors -----------------------------------------------------
 
-    if let Ok(id) = SensorId::new("cpu.utilization") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "CPU Utilization".to_string(),
-        category: "cpu".to_string(),
-        unit: "percent".to_string(),
-        device: None,
-        tags: vec!["cpu".to_string()],
-      });
+  fn discover_memory_sensors() -> Vec<SensorDescriptor> {
+    let mut sensors = Vec::new();
+    if read_sys_file(Path::new("/proc/meminfo")).is_none() {
+      tracing::warn!("Failed to read /proc/meminfo; memory sensors omitted");
+      return sensors;
     }
 
-    Ok(sensors)
+    // Canonical.
+    push_descriptor(
+      &mut sensors,
+      canonical::MEMORY_USED_PERCENT,
+      "Memory Used",
+      "utilization",
+      canonical::UNIT_PERCENT,
+      None,
+      &["memory"],
+    );
+    push_descriptor(
+      &mut sensors,
+      canonical::MEMORY_USED,
+      "Memory Used",
+      "memory",
+      canonical::UNIT_MB,
+      None,
+      &["memory"],
+    );
+
+    // Extras (best-effort), aligned to MB for consistency with memory.used.
+    push_descriptor(
+      &mut sensors,
+      "memory.total",
+      "Memory Total",
+      "memory",
+      canonical::UNIT_MB,
+      None,
+      &["memory"],
+    );
+    push_descriptor(
+      &mut sensors,
+      "memory.available",
+      "Memory Available",
+      "memory",
+      canonical::UNIT_MB,
+      None,
+      &["memory"],
+    );
+
+    sensors
   }
 
-  fn discover_memory_sensors() -> std::io::Result<Vec<SensorDescriptor>> {
-    let _content = fs::read_to_string("/proc/meminfo")?;
-    let mut sensors = Vec::new();
+  // --- Temperature descriptors (canonical cpu.temperature handled above) ------
 
-    if let Ok(id) = SensorId::new("memory.used") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "Memory Used".to_string(),
-        category: "memory".to_string(),
-        unit: "bytes".to_string(),
-        device: None,
-        tags: vec!["memory".to_string()],
-      });
-    }
-
-    if let Ok(id) = SensorId::new("memory.total") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "Memory Total".to_string(),
-        category: "memory".to_string(),
-        unit: "bytes".to_string(),
-        device: None,
-        tags: vec!["memory".to_string()],
-      });
-    }
-
-    if let Ok(id) = SensorId::new("memory.utilization") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "Memory Utilization".to_string(),
-        category: "memory".to_string(),
-        unit: "percent".to_string(),
-        device: None,
-        tags: vec!["memory".to_string()],
-      });
-    }
-
-    if let Ok(id) = SensorId::new("memory.available") {
-      sensors.push(SensorDescriptor {
-        id,
-        name: "Memory Available".to_string(),
-        category: "memory".to_string(),
-        unit: "bytes".to_string(),
-        device: None,
-        tags: vec!["memory".to_string()],
-      });
-    }
-
-    Ok(sensors)
-  }
-
-  fn discover_hwmon_sensors() -> std::io::Result<Vec<SensorDescriptor>> {
+  /// Discover granular per-hwmon temperature sensors as best-effort extras.
+  /// The canonical cpu.temperature / gpu.temperature are emitted elsewhere.
+  /// `make_temp_sensor_id` always produces device-qualified ids of 3-4 segments
+  /// (e.g. `cpu.k10temp.temp1.temperature`), so these structurally cannot equal
+  /// the 2-segment canonical ids and never collide with the canonical 7.
+  fn discover_temperature_sensors() -> Vec<SensorDescriptor> {
     let mut sensors = Vec::new();
     let hwmon_path = Path::new("/sys/class/hwmon");
+    let Some(entries) = read_sys_dir(hwmon_path) else {
+      return sensors;
+    };
 
-    if !hwmon_path.exists() {
-      tracing::debug!("hwmon path does not exist: {}", hwmon_path.display());
-      return Ok(sensors);
-    }
-
-    let entries = fs::read_dir(hwmon_path)?;
-    for entry in entries {
-      let entry = entry?;
+    for entry in entries.flatten() {
       let hwmon_dir = entry.path();
+      let device_name = read_sys_file(&hwmon_dir.join("name"))
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+      if device_name.is_empty() {
+        continue;
+      }
 
-      let name = fs::read_to_string(hwmon_dir.join("name"))
-        .unwrap_or_else(|_| "unknown".to_string())
-        .trim()
-        .to_lowercase();
-
-      let temp_sensors = Self::find_temp_sensors(&hwmon_dir, &name);
-      sensors.extend(temp_sensors);
-    }
-
-    Ok(sensors)
-  }
-
-  fn find_temp_sensors(hwmon_dir: &Path, device_name: &str) -> Vec<SensorDescriptor> {
-    let mut sensors = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(hwmon_dir) {
-      for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-
-        if !(name.ends_with("_input") && name.starts_with("temp")) {
-          continue;
-        }
-
-        let index: String = name
-          .chars()
-          .skip(4)
-          .take_while(|c| c.is_ascii_digit())
-          .collect();
-
-        if index.is_empty() {
-          continue;
-        }
-
-        let label = fs::read_to_string(hwmon_dir.join(format!("temp{}_label", index)))
-          .ok()
-          .map(|s| s.trim().to_string());
-
-        let sensor_id = Self::make_temp_sensor_id(device_name, &index);
-
-        if let Ok(id) = SensorId::new(&sensor_id) {
-          let display_name = label.unwrap_or_else(|| format!("{} Temperature", device_name));
-
-          sensors.push(SensorDescriptor {
-            id,
-            name: display_name,
-            category: "temperature".to_string(),
-            unit: "celsius".to_string(),
-            device: Some(device_name.to_string()),
-            tags: vec!["thermal".to_string(), device_name.to_string()],
-          });
-        }
+      for (index, _label) in Self::temp_inputs(&hwmon_dir) {
+        let id = make_temp_sensor_id(&device_name, &index);
+        let label = read_sys_file(&hwmon_dir.join(format!("temp{}_label", index)))
+          .map(|s| s.trim().to_string())
+          .filter(|s| !s.is_empty());
+        let display = label.unwrap_or_else(|| format!("{} temp{}", device_name, index));
+        push_descriptor_owned(
+          &mut sensors,
+          id,
+          display,
+          "temperature".to_string(),
+          canonical::UNIT_CELSIUS.to_string(),
+          Some(device_name.clone()),
+          vec!["thermal".to_string(), device_name.clone()],
+        );
       }
     }
 
     sensors
   }
 
-  fn make_temp_sensor_id(device_name: &str, index: &str) -> String {
-    if device_name.contains("coretemp")
-      || device_name.contains("cpu")
-      || device_name.contains("k10temp")
-      || device_name.contains("k8temp")
-    {
-      format!("cpu.{}.temp{}.temperature", device_name, index)
-    } else if device_name.contains("gpu") || device_name.contains("nvidia") {
-      format!("gpu.{}.temp{}.temperature", device_name, index)
-    } else {
-      format!(
-        "{}.temp{}.temperature",
-        device_name.replace(' ', "_"),
-        index
-      )
+  // --- GPU descriptors --------------------------------------------------------
+
+  fn discover_gpu_sensors(discrete_gpu: Option<&Path>) -> Vec<SensorDescriptor> {
+    let mut sensors = Vec::new();
+    let Some(card) = discrete_gpu else {
+      return sensors;
+    };
+
+    if Self::read_gpu_busy_percent(card).is_some() {
+      push_descriptor(
+        &mut sensors,
+        canonical::GPU_UTILIZATION,
+        "GPU Utilization",
+        "utilization",
+        canonical::UNIT_PERCENT,
+        Some("gpu".to_string()),
+        &["gpu"],
+      );
     }
+    if Self::read_gpu_temperature_c(card).is_some() {
+      push_descriptor(
+        &mut sensors,
+        canonical::GPU_TEMPERATURE,
+        "GPU Temperature",
+        "temperature",
+        canonical::UNIT_CELSIUS,
+        Some("gpu".to_string()),
+        &["gpu", "thermal"],
+      );
+    }
+
+    sensors
   }
+
+  // ------------------------------------------------------------------------
+  // Discrete-GPU selection (deterministic): iterate /sys/class/drm/card*/device,
+  // candidate = readable gpu_busy_percent AND mem_info_vram_total, pick largest
+  // vram. Connector dirs (card1-DP-1) lack both files and are filtered out.
+  // ------------------------------------------------------------------------
+  fn find_discrete_gpu() -> Option<PathBuf> {
+    let drm = Path::new("/sys/class/drm");
+    let entries = read_sys_dir(drm)?;
+
+    let mut candidates: Vec<GpuCandidate<PathBuf>> = Vec::new();
+    for entry in entries.flatten() {
+      let device = entry.path().join("device");
+      let busy = device.join("gpu_busy_percent");
+      let vram = device.join("mem_info_vram_total");
+
+      let busy_ok = read_sys_file(&busy)
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .is_some();
+      let vram_total = read_sys_file(&vram).and_then(|s| s.trim().parse::<u64>().ok());
+
+      if let (true, Some(vram_total)) = (busy_ok, vram_total) {
+        candidates.push(GpuCandidate {
+          key: device,
+          vram_total,
+        });
+      }
+    }
+
+    pick_discrete_gpu(&candidates)
+  }
+
+  // ------------------------------------------------------------------------
+  // Raw readers (file IO; delegate math to the pure helpers above).
+  // ------------------------------------------------------------------------
 
   /// Get current timestamp in milliseconds since UNIX epoch.
   fn current_timestamp_ms() -> u64 {
@@ -310,12 +461,10 @@ impl LinuxProvider {
   }
 
   /// Parse /proc/stat first line (aggregate CPU stats).
-  /// Format: cpu  user nice system idle iowait irq softirq steal guest guest_nice
   fn read_cpu_stats() -> Option<CpuStats> {
-    let content = fs::read_to_string("/proc/stat").ok()?;
+    let content = read_sys_file(Path::new("/proc/stat"))?;
     let first_line = content.lines().next()?;
 
-    // Skip "cpu" prefix and parse values
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 8 || parts[0] != "cpu" {
       return None;
@@ -338,58 +487,206 @@ impl LinuxProvider {
     })
   }
 
-  /// Poll CPU utilization sensor.
-  /// Requires previous stats for delta calculation.
-  fn poll_cpu(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
-    let current_stats = match Self::read_cpu_stats() {
-      Some(stats) => stats,
-      None => {
-        tracing::warn!("Failed to read /proc/stat for CPU utilization");
-        return;
-      }
-    };
-
-    // Calculate utilization if we have previous stats
-    let mut prev_guard = self.prev_cpu_stats.lock().unwrap();
-    if let Some(prev_stats) = prev_guard.as_ref() {
-      if let Some(utilization) = CpuStats::utilization_from(*prev_stats, current_stats) {
-        if let Ok(id) = SensorId::new("cpu.utilization") {
-          samples.push(SensorSample {
-            sensor_id: id,
-            timestamp_ms,
-            value: Some(utilization),
-          });
+  /// Mean CPU clock in MHz: average of every readable
+  /// /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq (kHz -> MHz).
+  /// Fallback: mean of "cpu MHz" lines in /proc/cpuinfo.
+  fn read_cpu_clock_mhz() -> Option<f64> {
+    let mut freqs: Vec<String> = Vec::new();
+    if let Some(entries) = read_sys_dir(Path::new("/sys/devices/system/cpu")) {
+      for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Match cpu0, cpu1, ... but not cpufreq, cpuidle, etc.
+        if !(name.starts_with("cpu")
+          && name.len() > 3
+          && name[3..].chars().all(|c| c.is_ascii_digit()))
+        {
+          continue;
+        }
+        let path = entry.path().join("cpufreq/scaling_cur_freq");
+        if let Some(content) = read_sys_file(&path) {
+          freqs.push(content);
         }
       }
     }
 
-    // Store current stats for next poll
-    *prev_guard = Some(current_stats);
+    if let Some(mhz) = mean_freq_mhz_from_khz(&freqs) {
+      return Some(mhz);
+    }
+
+    // Fallback to /proc/cpuinfo.
+    let cpuinfo = read_sys_file(Path::new("/proc/cpuinfo"))?;
+    mean_cpuinfo_mhz(&cpuinfo)
   }
 
-  /// Parse /proc/meminfo and return key-value pairs in kB.
-  fn read_meminfo() -> Option<HashMap<String, u64>> {
-    let content = fs::read_to_string("/proc/meminfo").ok()?;
-    let mut meminfo = HashMap::new();
+  /// CPU package temperature in °C. Prefers k10temp "Tctl" (AMD) or coretemp
+  /// "Package id 0" (Intel); falls back to the first temp of
+  /// k10temp/coretemp/zenpower.
+  fn read_cpu_temperature_c() -> Option<f64> {
+    let hwmon_path = Path::new("/sys/class/hwmon");
+    let entries = read_sys_dir(hwmon_path)?;
 
+    let mut fallback: Option<f64> = None;
+
+    for entry in entries.flatten() {
+      let dir = entry.path();
+      let device_name = read_sys_file(&dir.join("name"))
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+
+      let is_cpu = device_name == "k10temp"
+        || device_name == "coretemp"
+        || device_name == "zenpower"
+        || device_name == "k8temp";
+      if !is_cpu {
+        continue;
+      }
+
+      for (index, label) in Self::temp_inputs(&dir) {
+        let label_lc = label.to_ascii_lowercase();
+        let preferred = label_lc == "tctl" || label_lc == "package id 0";
+
+        if let Some(c) = Self::read_temp_input_c(&dir, &index) {
+          if preferred {
+            return Some(c);
+          }
+          if fallback.is_none() {
+            fallback = Some(c);
+          }
+        }
+      }
+    }
+
+    fallback
+  }
+
+  /// Read the discrete GPU's busy percent from card/device/gpu_busy_percent.
+  fn read_gpu_busy_percent(card_device: &Path) -> Option<f64> {
+    read_sys_file(&card_device.join("gpu_busy_percent"))?
+      .trim()
+      .parse::<f64>()
+      .ok()
+      .map(|v| v.clamp(0.0, 100.0))
+  }
+
+  /// Read the discrete GPU's temperature in °C from the SAME card's hwmon:
+  /// card/device/hwmon/hwmon*/tempK_input where label=="edge", else temp1.
+  fn read_gpu_temperature_c(card_device: &Path) -> Option<f64> {
+    let hwmon_root = card_device.join("hwmon");
+    let entries = read_sys_dir(&hwmon_root)?;
+
+    for entry in entries.flatten() {
+      let dir = entry.path();
+      let inputs = Self::temp_inputs(&dir);
+      if inputs.is_empty() {
+        continue;
+      }
+
+      // Prefer the "edge" label.
+      for (index, label) in &inputs {
+        if label.eq_ignore_ascii_case("edge") {
+          if let Some(c) = Self::read_temp_input_c(&dir, index) {
+            return Some(c);
+          }
+        }
+      }
+      // Fallback: temp1.
+      if let Some(c) = Self::read_temp_input_c(&dir, "1") {
+        return Some(c);
+      }
+    }
+
+    None
+  }
+
+  /// Enumerate (index, label) for every tempN_input in a hwmon dir. Label is ""
+  /// when no tempN_label file exists.
+  fn temp_inputs(dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(entries) = read_sys_dir(dir) else {
+      return out;
+    };
+    for entry in entries.flatten() {
+      let file_name = entry.file_name();
+      let name = file_name.to_string_lossy();
+      if !(name.starts_with("temp") && name.ends_with("_input")) {
+        continue;
+      }
+      let index: String = name
+        .chars()
+        .skip(4)
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+      if index.is_empty() {
+        continue;
+      }
+      let label = read_sys_file(&dir.join(format!("temp{}_label", index)))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+      out.push((index, label));
+    }
+    out
+  }
+
+  /// Read tempN_input from a hwmon dir and convert millidegrees -> °C.
+  fn read_temp_input_c(dir: &Path, index: &str) -> Option<f64> {
+    let raw = read_sys_file(&dir.join(format!("temp{}_input", index)))?;
+    millidegrees_to_celsius(&raw)
+  }
+
+  /// Parse /proc/meminfo into a map of kB values (raw kB, not bytes).
+  fn read_meminfo_kb() -> Option<HashMap<String, u64>> {
+    let content = read_sys_file(Path::new("/proc/meminfo"))?;
+    let mut meminfo = HashMap::new();
     for line in content.lines() {
       let parts: Vec<&str> = line.split_whitespace().collect();
       if parts.len() >= 2 {
-        // Remove trailing colon from key (e.g., "MemTotal:")
         let key = parts[0].trim_end_matches(':');
-        // Value is in kB, convert to bytes
         if let Ok(kb) = parts[1].parse::<u64>() {
-          meminfo.insert(key.to_string(), kb * 1024);
+          meminfo.insert(key.to_string(), kb);
         }
       }
     }
-
     Some(meminfo)
   }
 
-  /// Poll memory sensors from /proc/meminfo.
+  // ------------------------------------------------------------------------
+  // Pollers.
+  // ------------------------------------------------------------------------
+
+  fn poll_cpu(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+    // Utilization (requires delta from a previous poll).
+    match Self::read_cpu_stats() {
+      Some(current_stats) => {
+        let mut prev_guard = self.prev_cpu_stats.lock().unwrap();
+        if let Some(prev_stats) = prev_guard.as_ref() {
+          if let Some(util) = CpuStats::utilization_from(*prev_stats, current_stats) {
+            push_sample(
+              samples,
+              canonical::CPU_UTILIZATION,
+              timestamp_ms,
+              Some(util),
+            );
+          }
+        }
+        *prev_guard = Some(current_stats);
+      }
+      None => tracing::warn!("Failed to read /proc/stat for CPU utilization"),
+    }
+
+    // Clock.
+    if let Some(mhz) = Self::read_cpu_clock_mhz() {
+      push_sample(samples, canonical::CPU_CLOCK, timestamp_ms, Some(mhz));
+    }
+
+    // Temperature.
+    if let Some(c) = Self::read_cpu_temperature_c() {
+      push_sample(samples, canonical::CPU_TEMPERATURE, timestamp_ms, Some(c));
+    }
+  }
+
   fn poll_memory(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
-    let meminfo = match Self::read_meminfo() {
+    let meminfo = match Self::read_meminfo_kb() {
       Some(info) => info,
       None => {
         tracing::warn!("Failed to read /proc/meminfo");
@@ -397,140 +694,222 @@ impl LinuxProvider {
       }
     };
 
-    let mem_total = meminfo.get("MemTotal").copied().unwrap_or(0);
-    let mem_available = meminfo.get("MemAvailable").copied().unwrap_or(0);
-    let mem_free = meminfo.get("MemFree").copied().unwrap_or(0);
-    let buffers = meminfo.get("Buffers").copied().unwrap_or(0);
-    let cached = meminfo.get("Cached").copied().unwrap_or(0);
-
-    // Used memory = Total - Available (more accurate than Total - Free)
-    let mem_used = mem_total.saturating_sub(mem_available);
-
-    // Memory utilization percentage
-    let mem_utilization = if mem_total > 0 {
-      Some((mem_used as f64 / mem_total as f64) * 100.0)
-    } else {
-      None
-    };
-
-    // Push samples
-    if let Ok(id) = SensorId::new("memory.total") {
-      samples.push(SensorSample {
-        sensor_id: id,
-        timestamp_ms,
-        value: Some(mem_total as f64),
-      });
+    match meminfo_used(&meminfo) {
+      Some(usage) => {
+        push_sample(
+          samples,
+          canonical::MEMORY_USED_PERCENT,
+          timestamp_ms,
+          Some(usage.used_percent),
+        );
+        push_sample(
+          samples,
+          canonical::MEMORY_USED,
+          timestamp_ms,
+          Some(usage.used_mb),
+        );
+      }
+      None => {
+        tracing::warn!("meminfo missing MemTotal/MemAvailable; memory.used* omitted this tick")
+      }
     }
 
-    if let Ok(id) = SensorId::new("memory.used") {
-      samples.push(SensorSample {
-        sensor_id: id,
+    // Extras in MB.
+    if let Some(total_kb) = meminfo.get("MemTotal").copied() {
+      push_sample(
+        samples,
+        "memory.total",
         timestamp_ms,
-        value: Some(mem_used as f64),
-      });
+        Some(total_kb as f64 / 1024.0),
+      );
     }
-
-    if let Ok(id) = SensorId::new("memory.available") {
-      samples.push(SensorSample {
-        sensor_id: id,
+    if let Some(avail_kb) = meminfo.get("MemAvailable").copied() {
+      push_sample(
+        samples,
+        "memory.available",
         timestamp_ms,
-        value: Some(mem_available as f64),
-      });
+        Some(avail_kb as f64 / 1024.0),
+      );
     }
-
-    if let Ok(id) = SensorId::new("memory.utilization") {
-      samples.push(SensorSample {
-        sensor_id: id,
-        timestamp_ms,
-        value: mem_utilization,
-      });
-    }
-
-    // Log additional info for debugging
-    tracing::trace!(
-      "Memory: total={}MB, used={}MB, available={}MB, free={}MB, buffers={}MB, cached={}MB",
-      mem_total / 1024 / 1024,
-      mem_used / 1024 / 1024,
-      mem_available / 1024 / 1024,
-      mem_free / 1024 / 1024,
-      buffers / 1024 / 1024,
-      cached / 1024 / 1024
-    );
   }
 
-  /// Poll temperature sensors from /sys/class/hwmon.
   fn poll_temperatures(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+    // Canonical cpu.temperature is emitted by poll_cpu. Here we emit only the
+    // granular per-hwmon extras; their device-qualified ids (3-4 segments) can
+    // never equal the 2-segment canonical ids, so there is no collision to guard.
     let hwmon_path = Path::new("/sys/class/hwmon");
-
-    if !hwmon_path.exists() {
-      tracing::trace!("hwmon path does not exist");
+    let Some(entries) = read_sys_dir(hwmon_path) else {
       return;
-    }
-
-    let entries = match fs::read_dir(hwmon_path) {
-      Ok(e) => e,
-      Err(e) => {
-        tracing::warn!("Failed to read hwmon directory: {}", e);
-        return;
-      }
     };
 
     for entry in entries.flatten() {
-      let hwmon_dir = entry.path();
+      let dir = entry.path();
+      let device_name = read_sys_file(&dir.join("name"))
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+      if device_name.is_empty() {
+        continue;
+      }
 
-      let device_name = match fs::read_to_string(hwmon_dir.join("name")) {
-        Ok(name) => name.trim().to_lowercase(),
-        Err(_) => continue,
-      };
-
-      // Find and read temperature input files
-      if let Ok(dir_entries) = fs::read_dir(&hwmon_dir) {
-        for file_entry in dir_entries.flatten() {
-          let file_name = file_entry.file_name();
-          let name = file_name.to_string_lossy();
-
-          if !(name.ends_with("_input") && name.starts_with("temp")) {
-            continue;
-          }
-
-          let index: String = name
-            .chars()
-            .skip(4)
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-
-          if index.is_empty() {
-            continue;
-          }
-
-          // Read temperature value (in millidegrees Celsius)
-          let temp_content = match fs::read_to_string(file_entry.path()) {
-            Ok(c) => c,
-            Err(e) => {
-              tracing::trace!("Failed to read {}: {}", file_entry.path().display(), e);
-              continue;
-            }
-          };
-
-          let temp_mc: i64 = match temp_content.trim().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-          };
-
-          // Convert millidegrees to Celsius
-          let temp_c = temp_mc as f64 / 1000.0;
-
-          let sensor_id_str = Self::make_temp_sensor_id(&device_name, &index);
-          if let Ok(id) = SensorId::new(&sensor_id_str) {
-            samples.push(SensorSample {
-              sensor_id: id,
-              timestamp_ms,
-              value: Some(temp_c),
-            });
-          }
+      for (index, _label) in Self::temp_inputs(&dir) {
+        let id = make_temp_sensor_id(&device_name, &index);
+        if let Some(c) = Self::read_temp_input_c(&dir, &index) {
+          push_sample_owned(samples, id, timestamp_ms, Some(c));
         }
       }
     }
+  }
+
+  fn poll_gpu(&self, samples: &mut Vec<SensorSample>, timestamp_ms: u64) {
+    let Some(card) = self.discrete_gpu.as_deref() else {
+      return;
+    };
+    if let Some(busy) = Self::read_gpu_busy_percent(card) {
+      push_sample(
+        samples,
+        canonical::GPU_UTILIZATION,
+        timestamp_ms,
+        Some(busy),
+      );
+    }
+    if let Some(c) = Self::read_gpu_temperature_c(card) {
+      push_sample(samples, canonical::GPU_TEMPERATURE, timestamp_ms, Some(c));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Small free helpers shared by discover/poll (keep IDs / units in one place).
+// ---------------------------------------------------------------------------
+
+/// Read a /proc or /sys file, treating absence (`NotFound`) as an expected,
+/// silent `None` — most sensors are simply not present on a given machine — but
+/// logging any *other* I/O error (permission denied, I/O failure, device
+/// removed) with the path. This makes the module's "missing source is skipped
+/// and logged" contract true: expected absence stays quiet, genuine failures
+/// are surfaced and diagnosable instead of vanishing into a bare `.ok()`.
+#[cfg(target_os = "linux")]
+fn read_sys_file(path: &Path) -> Option<String> {
+  match fs::read_to_string(path) {
+    Ok(s) => Some(s),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    Err(e) => {
+      tracing::warn!("Unexpected error reading {}: {}", path.display(), e);
+      None
+    }
+  }
+}
+
+/// Directory counterpart to [`read_sys_file`]: `NotFound` is a silent `None`
+/// (the subsystem isn't present), any other error is logged with the path.
+#[cfg(target_os = "linux")]
+fn read_sys_dir(path: &Path) -> Option<fs::ReadDir> {
+  match fs::read_dir(path) {
+    Ok(d) => Some(d),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    Err(e) => {
+      tracing::warn!(
+        "Unexpected error reading directory {}: {}",
+        path.display(),
+        e
+      );
+      None
+    }
+  }
+}
+
+/// Build a device-qualified id for a granular per-hwmon temp extra.
+/// Returns an empty string for names that cannot form a valid id; the caller
+/// then skips it via SensorId::new failing. Canonical ids are produced
+/// elsewhere — this is for extras only.
+#[cfg(target_os = "linux")]
+fn make_temp_sensor_id(device_name: &str, index: &str) -> String {
+  // Sanitize: SensorId allows only [a-z0-9.]. Replace anything else with nothing
+  // so we don't emit invalid ids (e.g. "r8169_0_800:00" -> "r8169080000").
+  let sanitized: String = device_name
+    .chars()
+    .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    .collect();
+  if sanitized.is_empty() {
+    return String::new();
+  }
+  if sanitized.contains("coretemp")
+    || sanitized.contains("k10temp")
+    || sanitized.contains("k8temp")
+    || sanitized.contains("zenpower")
+  {
+    format!("cpu.{}.temp{}.temperature", sanitized, index)
+  } else if sanitized.contains("amdgpu") || sanitized.contains("nvidia") {
+    format!("gpu.{}.temp{}.temperature", sanitized, index)
+  } else {
+    format!("{}.temp{}.temperature", sanitized, index)
+  }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn push_descriptor(
+  out: &mut Vec<SensorDescriptor>,
+  id: &str,
+  name: &str,
+  category: &str,
+  unit: &str,
+  device: Option<String>,
+  tags: &[&str],
+) {
+  push_descriptor_owned(
+    out,
+    id.to_string(),
+    name.to_string(),
+    category.to_string(),
+    unit.to_string(),
+    device,
+    tags.iter().map(|s| s.to_string()).collect(),
+  );
+}
+
+#[cfg(target_os = "linux")]
+fn push_descriptor_owned(
+  out: &mut Vec<SensorDescriptor>,
+  id: String,
+  name: String,
+  category: String,
+  unit: String,
+  device: Option<String>,
+  tags: Vec<String>,
+) {
+  match SensorId::new(&id) {
+    Ok(sensor_id) => out.push(SensorDescriptor {
+      id: sensor_id,
+      name,
+      category,
+      unit,
+      device,
+      tags,
+    }),
+    Err(e) => tracing::debug!("Skipping invalid sensor id '{}': {}", id, e),
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn push_sample(out: &mut Vec<SensorSample>, id: &str, timestamp_ms: u64, value: Option<f64>) {
+  push_sample_owned(out, id.to_string(), timestamp_ms, value);
+}
+
+#[cfg(target_os = "linux")]
+fn push_sample_owned(
+  out: &mut Vec<SensorSample>,
+  id: String,
+  timestamp_ms: u64,
+  value: Option<f64>,
+) {
+  match SensorId::new(&id) {
+    Ok(sensor_id) => out.push(SensorSample {
+      sensor_id,
+      timestamp_ms,
+      value,
+    }),
+    Err(e) => tracing::debug!("Skipping invalid sample id '{}': {}", id, e),
   }
 }
 
@@ -554,9 +933,10 @@ fn linux_manifest() -> ProviderManifest {
     },
     sensors: SensorCategories {
       categories: vec![
-        "cpu".to_string(),
-        "memory".to_string(),
+        "utilization".to_string(),
+        "frequency".to_string(),
         "temperature".to_string(),
+        "memory".to_string(),
       ],
     },
   }
@@ -581,10 +961,10 @@ impl Provider for LinuxProvider {
     let mut samples = Vec::new();
     let timestamp_ms = Self::current_timestamp_ms();
 
-    // Poll each sensor category
     self.poll_cpu(&mut samples, timestamp_ms);
     self.poll_memory(&mut samples, timestamp_ms);
     self.poll_temperatures(&mut samples, timestamp_ms);
+    self.poll_gpu(&mut samples, timestamp_ms);
 
     tracing::trace!("Linux provider polled {} samples", samples.len());
     Ok(samples)
@@ -599,20 +979,174 @@ impl Provider for LinuxProvider {
   }
 }
 
-#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
   use super::*;
 
   #[test]
-  fn test_cpu_stats_default() {
+  fn mean_freq_averages_and_converts_khz_to_mhz() {
+    let samples = ["5479613\n", "5517802\n", "5506199"];
+    let mhz = mean_freq_mhz_from_khz(&samples).expect("should compute");
+    // mean kHz = 5501204.67 -> ~5501.2 MHz
+    assert!((mhz - 5501.204).abs() < 0.5, "got {}", mhz);
+  }
+
+  #[test]
+  fn mean_freq_empty_is_none() {
+    let empty: [&str; 0] = [];
+    assert!(mean_freq_mhz_from_khz(&empty).is_none());
+    let garbage = ["abc", ""];
+    assert!(mean_freq_mhz_from_khz(&garbage).is_none());
+  }
+
+  #[test]
+  fn mean_freq_skips_unparseable_samples() {
+    // One CPU's scaling_cur_freq is unreadable/garbage: it must be excluded from
+    // BOTH the sum and the count, so the mean is over the valid samples only.
+    let mixed = ["5000000", "garbage", ""];
+    let mhz = mean_freq_mhz_from_khz(&mixed).expect("should compute from the valid sample");
+    assert!((mhz - 5000.0).abs() < f64::EPSILON, "got {}", mhz);
+  }
+
+  #[test]
+  fn cpuinfo_mhz_fallback_averages() {
+    let cpuinfo = "processor\t: 0\ncpu MHz\t\t: 4000.000\nprocessor\t: 1\ncpu MHz\t\t: 4200.000\n";
+    let mhz = mean_cpuinfo_mhz(cpuinfo).expect("should compute");
+    assert!((mhz - 4100.0).abs() < f64::EPSILON, "got {}", mhz);
+  }
+
+  #[test]
+  fn cpuinfo_mhz_no_match_is_none() {
+    // A cpuinfo with no "cpu MHz" lines triggers the fallback-of-the-fallback.
+    assert!(mean_cpuinfo_mhz("processor\t: 0\nvendor_id\t: AuthenticAMD\n").is_none());
+  }
+
+  #[test]
+  fn millidegrees_converts() {
+    assert!((millidegrees_to_celsius("50125").unwrap() - 50.125).abs() < f64::EPSILON);
+    assert!((millidegrees_to_celsius("  48000\n").unwrap() - 48.0).abs() < f64::EPSILON);
+    assert!(millidegrees_to_celsius("notanumber").is_none());
+    // Some sensors legitimately report sub-zero readings; conversion is signed.
+    assert!((millidegrees_to_celsius("-5000").unwrap() + 5.0).abs() < f64::EPSILON);
+  }
+
+  #[test]
+  fn pick_discrete_gpu_chooses_largest_vram() {
+    let candidates = vec![
+      GpuCandidate {
+        key: "card0",
+        vram_total: 2_147_483_648,
+      },
+      GpuCandidate {
+        key: "card1",
+        vram_total: 17_095_983_104,
+      },
+    ];
+    assert_eq!(pick_discrete_gpu(&candidates), Some("card1"));
+  }
+
+  #[test]
+  fn pick_discrete_gpu_none_when_empty() {
+    let candidates: Vec<GpuCandidate<&str>> = Vec::new();
+    assert!(pick_discrete_gpu(&candidates).is_none());
+  }
+
+  #[test]
+  fn pick_discrete_gpu_tie_resolves_to_first_seen() {
+    // Equal VRAM: the FIRST candidate wins (contract in the doc comment).
+    let candidates = vec![
+      GpuCandidate {
+        key: "card0",
+        vram_total: 17_095_983_104,
+      },
+      GpuCandidate {
+        key: "card1",
+        vram_total: 17_095_983_104,
+      },
+    ];
+    assert_eq!(pick_discrete_gpu(&candidates), Some("card0"));
+  }
+
+  #[test]
+  fn meminfo_used_computes_mb_and_percent() {
+    let mut m = HashMap::new();
+    m.insert("MemTotal".to_string(), 63_307_136u64); // kB
+    m.insert("MemAvailable".to_string(), 21_401_844u64); // kB
+    let usage = meminfo_used(&m).expect("should compute");
+    // used kB = 41_905_292 -> /1024 = 40923.14 MB
+    assert!(
+      (usage.used_mb - 40923.14).abs() < 1.0,
+      "mb={}",
+      usage.used_mb
+    );
+    // percent = 41_905_292 / 63_307_136 * 100 = 66.19%
+    assert!(
+      (usage.used_percent - 66.19).abs() < 0.5,
+      "pct={}",
+      usage.used_percent
+    );
+  }
+
+  #[test]
+  fn meminfo_used_missing_total_is_none() {
+    let m = HashMap::new();
+    assert!(meminfo_used(&m).is_none());
+  }
+
+  #[test]
+  fn meminfo_used_missing_available_is_none() {
+    // Without MemAvailable we can't compute "used" honestly; rather than peg the
+    // gauge at 100% (used == total), the helper omits the reading entirely.
+    let mut m = HashMap::new();
+    m.insert("MemTotal".to_string(), 63_307_136u64);
+    assert!(meminfo_used(&m).is_none());
+  }
+
+  #[test]
+  fn meminfo_used_zero_total_is_none() {
+    let mut m = HashMap::new();
+    m.insert("MemTotal".to_string(), 0u64);
+    m.insert("MemAvailable".to_string(), 0u64);
+    assert!(meminfo_used(&m).is_none());
+  }
+
+  #[test]
+  fn make_temp_id_classifies_and_sanitizes() {
+    assert_eq!(
+      make_temp_sensor_id("k10temp", "1"),
+      "cpu.k10temp.temp1.temperature"
+    );
+    assert_eq!(
+      make_temp_sensor_id("amdgpu", "1"),
+      "gpu.amdgpu.temp1.temperature"
+    );
+    // Non-alphanumerics stripped AND the result must be a valid SensorId (not
+    // just valid characters): the caller relies on SensorId::new accepting it.
+    let id = make_temp_sensor_id("r8169_0_800:00", "1");
+    SensorId::new(&id)
+      .unwrap_or_else(|e| panic!("sanitized id {id:?} is not a valid SensorId: {e}"));
+  }
+
+  #[test]
+  fn make_temp_id_unsanitizable_name_is_empty() {
+    // A name with no [a-z0-9] survivors yields "", which SensorId::new rejects,
+    // so the caller skips it. Pin both halves of that contract.
+    let id = make_temp_sensor_id("_:-", "1");
+    assert_eq!(id, "");
+    assert!(SensorId::new(&id).is_err());
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn cpu_stats_default() {
     let stats = CpuStats::default();
     assert_eq!(stats.user, 0);
     assert_eq!(stats.idle, 0);
   }
 
+  #[cfg(target_os = "linux")]
   #[test]
-  fn test_calculate_cpu_utilization_basic() {
+  fn cpu_utilization_basic() {
     let prev = CpuStats {
       user: 100,
       nice: 0,
@@ -625,75 +1159,54 @@ mod tests {
       guest: 0,
       guest_nice: 0,
     };
-
     let curr = CpuStats {
-      user: 150, // +50
+      user: 150,
       nice: 0,
-      system: 75, // +25
-      idle: 900,  // +90
-      iowait: 15, // +5
-      irq: 7,     // +2
-      softirq: 6, // +1
+      system: 75,
+      idle: 900,
+      iowait: 15,
+      irq: 7,
+      softirq: 6,
       steal: 0,
       guest: 0,
       guest_nice: 0,
     };
-
-    // Total delta = 50 + 0 + 25 + 100 + 5 + 2 + 1 = 183
-    // Idle delta = 100 + 5 = 105
-    // Active delta = 183 - 105 = 78
-    // Utilization = 78 / 183 * 100 = 42.62%
-    let utilization = CpuStats::utilization_from(prev, curr);
-    assert!(utilization.is_some());
-
-    let util = utilization.unwrap();
+    let util = CpuStats::utilization_from(prev, curr).expect("some");
     assert!(util > 42.0 && util < 43.0, "Expected ~42.6%, got {}", util);
   }
 
+  #[cfg(target_os = "linux")]
   #[test]
-  fn test_calculate_cpu_utilization_zero_delta() {
+  fn cpu_utilization_zero_delta_is_none() {
     let stats = CpuStats {
       user: 100,
-      nice: 0,
-      system: 50,
       idle: 800,
-      iowait: 10,
-      irq: 5,
-      softirq: 5,
-      steal: 0,
-      guest: 0,
-      guest_nice: 0,
+      ..CpuStats::default()
     };
-
-    // Same stats should return None (no change)
-    let utilization = CpuStats::utilization_from(stats, stats);
-    assert!(utilization.is_none());
+    assert!(CpuStats::utilization_from(stats, stats).is_none());
   }
 
+  #[cfg(target_os = "linux")]
   #[test]
-  fn test_calculate_cpu_utilization_clamp() {
+  fn cpu_utilization_clamps_to_100() {
     let prev = CpuStats {
       user: 100,
       idle: 100,
       ..CpuStats::default()
     };
-
-    // Edge case: all active, no idle
     let curr = CpuStats {
-      user: 200, // +100 active
-      idle: 100, // 0 idle
+      user: 200,
+      idle: 100,
       ..CpuStats::default()
     };
-
-    let utilization = CpuStats::utilization_from(prev, curr);
-    assert!(utilization.is_some());
-    assert!((utilization.unwrap() - 100.0).abs() < f64::EPSILON);
+    let util = CpuStats::utilization_from(prev, curr).expect("some");
+    assert!((util - 100.0).abs() < f64::EPSILON);
   }
 
+  #[cfg(target_os = "linux")]
   #[test]
-  fn test_current_timestamp_ms() {
+  fn timestamp_is_recent() {
     let ts = LinuxProvider::current_timestamp_ms();
-    // Should be a reasonable timestamp (after year 2020)
-    assert!(ts > 1577836800000); // Jan 1, 2020 in ms
+    assert!(ts > 1_577_836_800_000);
   }
 }

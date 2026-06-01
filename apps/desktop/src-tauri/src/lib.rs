@@ -44,7 +44,10 @@ async fn build_snapshot(store: &SensorStore) -> Vec<SensorReading> {
         timestamp_ms,
       });
     } else {
-      tracing::warn!("Sensor {:?} has no descriptor; omitting from snapshot", sensor_id);
+      tracing::warn!(
+        "Sensor {:?} has no descriptor; omitting from snapshot",
+        sensor_id
+      );
     }
   }
 
@@ -105,6 +108,129 @@ async fn list_available_sensors(
   Ok(sensors)
 }
 
+/// Builds the demo MockProvider, which emits the canonical sensor ids the
+/// default panel binds to (so the UI stays populated even as a fallback).
+fn make_mock_provider() -> Arc<Box<dyn astragauge_provider_host::Provider>> {
+  Arc::new(Box::new(MockProvider::new_demo()))
+}
+
+/// Provider selection requested via the `ASTRAGAUGE_PROVIDER` env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderMode {
+  /// Default: best provider for the platform, with a fallback to the demo mock.
+  Auto,
+  /// Always the demo MockProvider.
+  Mock,
+  /// Force the LinuxProvider (Linux only; elsewhere falls back to mock).
+  Linux,
+}
+
+/// Parse the `ASTRAGAUGE_PROVIDER` value into a [`ProviderMode`]. Input is
+/// trimmed and lowercased; empty / `auto` / any unrecognized value maps to
+/// `Auto` (an unrecognized non-empty value is warned about).
+fn parse_provider_mode(raw: &str) -> ProviderMode {
+  match raw.trim().to_ascii_lowercase().as_str() {
+    "mock" => ProviderMode::Mock,
+    "linux" => ProviderMode::Linux,
+    "" | "auto" => ProviderMode::Auto,
+    other => {
+      tracing::warn!(
+        "Unrecognized ASTRAGAUGE_PROVIDER={:?}; defaulting to auto selection",
+        other
+      );
+      ProviderMode::Auto
+    }
+  }
+}
+
+/// Selects the sensor provider based on the `ASTRAGAUGE_PROVIDER` env var.
+///
+/// Values: `auto` (default) | `mock` | `linux`.
+/// - `auto`: on Linux, use LinuxProvider unless it discovers 0 sensors *or
+///   discovery fails*, in which case fall back to the demo MockProvider. On
+///   non-Linux, use mock.
+/// - `mock`: always the demo MockProvider.
+/// - `linux`: force LinuxProvider on Linux; on non-Linux, warn and use mock.
+///
+/// Returns the chosen provider plus a human-readable reason for logging.
+/// Every reference to `LinuxProvider` is `#[cfg(target_os = "linux")]`-gated
+/// so the app still compiles on macOS/Windows.
+fn select_provider() -> (Arc<Box<dyn astragauge_provider_host::Provider>>, String) {
+  let requested = std::env::var("ASTRAGAUGE_PROVIDER").unwrap_or_default();
+
+  match parse_provider_mode(&requested) {
+    ProviderMode::Mock => (
+      make_mock_provider(),
+      "MockProvider (demo): ASTRAGAUGE_PROVIDER=mock".to_string(),
+    ),
+    ProviderMode::Linux => {
+      #[cfg(target_os = "linux")]
+      {
+        let provider = astragauge_providers::LinuxProvider::new();
+        (
+          Arc::new(Box::new(provider)),
+          "LinuxProvider: ASTRAGAUGE_PROVIDER=linux (forced)".to_string(),
+        )
+      }
+      #[cfg(not(target_os = "linux"))]
+      {
+        tracing::warn!(
+          "ASTRAGAUGE_PROVIDER=linux requested on a non-Linux platform; \
+           LinuxProvider is unavailable, using demo MockProvider instead"
+        );
+        (
+          make_mock_provider(),
+          "MockProvider (demo): ASTRAGAUGE_PROVIDER=linux requested on non-Linux platform"
+            .to_string(),
+        )
+      }
+    }
+    ProviderMode::Auto => {
+      #[cfg(target_os = "linux")]
+      {
+        let provider = astragauge_providers::LinuxProvider::new();
+        // discover() returns the eagerly-discovered descriptors (a Vec clone),
+        // so this resolves immediately on Tauri's global runtime. A discovery
+        // error is distinct from "0 sensors" — surface it rather than silently
+        // mislabeling the fallback.
+        match tauri::async_runtime::block_on(astragauge_provider_host::Provider::discover(
+          &provider,
+        )) {
+          Ok(sensors) if !sensors.is_empty() => (
+            Arc::new(Box::new(provider)),
+            format!(
+              "LinuxProvider: auto selected ({} sensors discovered)",
+              sensors.len()
+            ),
+          ),
+          Ok(_) => (
+            make_mock_provider(),
+            "MockProvider (demo): auto fallback — LinuxProvider discovered 0 sensors".to_string(),
+          ),
+          Err(e) => {
+            tracing::error!(
+              "LinuxProvider::discover() failed during auto-selection: {}; \
+               falling back to demo MockProvider",
+              e
+            );
+            (
+              make_mock_provider(),
+              format!("MockProvider (demo): auto fallback — LinuxProvider discovery failed: {e}"),
+            )
+          }
+        }
+      }
+      #[cfg(not(target_os = "linux"))]
+      {
+        (
+          make_mock_provider(),
+          "MockProvider (demo): auto selection on non-Linux platform".to_string(),
+        )
+      }
+    }
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let store = Arc::new(SensorStore::new());
@@ -112,14 +238,13 @@ pub fn run() {
   let config = HostConfig::default();
   let host = Arc::new(std::sync::RwLock::new(ProviderHost::new(config, store)));
 
-  let mock_provider = MockProvider::new_demo();
-  let mock_provider_arc: Arc<Box<dyn astragauge_provider_host::Provider>> =
-    Arc::new(Box::new(mock_provider));
+  let (provider, reason) = select_provider();
+  tracing::info!("Selected sensor provider: {}", reason);
   host
     .write()
     .expect("Provider host lock should not be poisoned at startup")
-    .register_provider(mock_provider_arc)
-    .expect("Failed to register MockProvider");
+    .register_provider(provider)
+    .expect("Failed to register selected provider");
 
   let host_clone = Arc::clone(&host);
   let store_for_emitter = Arc::clone(&store_clone);
@@ -178,6 +303,32 @@ pub fn run() {
 mod tests {
   use super::*;
   use astragauge_provider_host::{ProviderHealth, ProviderStatus};
+
+  #[test]
+  fn test_parse_provider_mode_recognized_values() {
+    assert_eq!(parse_provider_mode("mock"), ProviderMode::Mock);
+    assert_eq!(parse_provider_mode("linux"), ProviderMode::Linux);
+    assert_eq!(parse_provider_mode("auto"), ProviderMode::Auto);
+  }
+
+  #[test]
+  fn test_parse_provider_mode_empty_and_default() {
+    assert_eq!(parse_provider_mode(""), ProviderMode::Auto);
+    assert_eq!(parse_provider_mode("   "), ProviderMode::Auto);
+  }
+
+  #[test]
+  fn test_parse_provider_mode_trims_and_lowercases() {
+    assert_eq!(parse_provider_mode("  MoCk  "), ProviderMode::Mock);
+    assert_eq!(parse_provider_mode("LINUX"), ProviderMode::Linux);
+    assert_eq!(parse_provider_mode(" Auto\n"), ProviderMode::Auto);
+  }
+
+  #[test]
+  fn test_parse_provider_mode_unrecognized_falls_back_to_auto() {
+    assert_eq!(parse_provider_mode("garbage"), ProviderMode::Auto);
+    assert_eq!(parse_provider_mode("windows"), ProviderMode::Auto);
+  }
 
   #[test]
   fn test_provider_status_serialization() {
