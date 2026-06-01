@@ -1,10 +1,6 @@
 <script lang="ts">
   import { formatValue } from '../format';
-
-  interface Thresholds {
-    warn?: number;
-    critical?: number;
-  }
+  import type { Thresholds } from '../types';
 
   interface Props {
     value: number | null;

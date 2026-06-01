@@ -1,11 +1,7 @@
 <script lang="ts">
   import Sparkline from '../Sparkline.svelte';
   import { formatValue } from '../format';
-
-  interface Thresholds {
-    warn?: number;
-    critical?: number;
-  }
+  import type { Thresholds } from '../types';
 
   let {
     value = null,

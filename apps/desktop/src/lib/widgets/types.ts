@@ -5,10 +5,15 @@ export interface WidgetSizing {
   min_h: number;
 }
 
+export interface Thresholds {
+  warn?: number;
+  critical?: number;
+}
+
 export interface WidgetBinding {
   key: string;
   label: string;
-  value_type: string;
+  value_type: 'number' | 'string' | 'boolean';
   required: boolean;
 }
 

@@ -4,6 +4,23 @@
   import { sensors } from '$lib/data/sensors.svelte';
 
   let { panel }: { panel: PanelDocument } = $props();
+
+  $effect(() => {
+    for (const widget of panel.widgets) {
+      const entry = getWidget(widget.type);
+      if (!entry) {
+        console.warn(`[PanelGrid] Unknown widget type "${widget.type}" (id: ${widget.id})`);
+        continue;
+      }
+      for (const b of entry.manifest.bindings) {
+        if (b.required && !widget.bindings[b.key]) {
+          console.warn(
+            `[PanelGrid] Widget "${widget.type}" (id: ${widget.id}) missing required binding: "${b.key}"`
+          );
+        }
+      }
+    }
+  });
 </script>
 
 <div
@@ -29,12 +46,16 @@
             props={widget.props}
             history={sensors.getHistory(valueId)}
           />
-          {#snippet failed()}
-            <div class="fallback error">sensor unavailable</div>
+          {#snippet failed(error)}
+            {@const _ = console.error(
+              `[PanelGrid] Widget "${widget.type}" (id: ${widget.id}) render error:`,
+              error
+            )}
+            <div class="fallback error">widget error</div>
           {/snippet}
         </svelte:boundary>
       {:else}
-        <div class="fallback">unknown widget</div>
+        <div class="fallback">unknown widget: {widget.type}</div>
       {/if}
     </div>
   {/each}

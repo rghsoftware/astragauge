@@ -4,17 +4,31 @@ import type { SensorReading } from './types';
 
 const HISTORY_CAP = 60;
 
-// Latest reading per sensor id.
 let readings = $state<Record<string, SensorReading>>({});
-// Bounded history of recent values per sensor id (capped at HISTORY_CAP).
 let historyMap = $state<Record<string, number[]>>({});
+let initError = $state<string | null>(null);
 
 let started = false;
+let unlisten: (() => void) | null = null;
+
+function isValidReading(r: SensorReading): boolean {
+  return (
+    typeof r.id === 'string' &&
+    r.id.length > 0 &&
+    (r.value === null ||
+      (typeof r.value === 'number' && Number.isFinite(r.value))) &&
+    typeof r.timestampMs === 'number' &&
+    r.timestampMs >= 0
+  );
+}
 
 function applyBatch(batch: SensorReading[]): void {
   for (const reading of batch) {
+    if (!isValidReading(reading)) {
+      console.warn('[sensors] dropping malformed reading:', reading);
+      continue;
+    }
     readings[reading.id] = reading;
-
     if (reading.value !== null) {
       const prev = historyMap[reading.id] ?? [];
       historyMap[reading.id] = [...prev, reading.value].slice(-HISTORY_CAP);
@@ -26,20 +40,26 @@ async function start(): Promise<void> {
   if (started) {
     return;
   }
-  started = true;
 
   try {
     const snapshot = await invoke<SensorReading[]>('get_sensor_snapshot');
     applyBatch(snapshot);
 
-    await listen<SensorReading[]>('sensors-update', (event) => {
+    unlisten = await listen<SensorReading[]>('sensors-update', (event) => {
       applyBatch(event.payload);
     });
+
+    started = true;
   } catch (err) {
-    // Non-Tauri (e.g. browser) context or transport failure: log and continue
-    // so the UI still renders with whatever data is available.
-    console.warn('sensors.start() failed; continuing without live data', err);
+    initError = err instanceof Error ? err.message : String(err);
+    console.error('[sensors] Failed to initialize live data pipeline:', err);
   }
+}
+
+function stop(): void {
+  unlisten?.();
+  unlisten = null;
+  started = false;
 }
 
 function getReading(id: string): SensorReading | undefined {
@@ -60,8 +80,12 @@ function allReadings(): SensorReading[] {
 
 export const sensors = {
   start,
+  stop,
   getReading,
   getValue,
   getHistory,
   allReadings,
+  get initError() {
+    return initError;
+  },
 };

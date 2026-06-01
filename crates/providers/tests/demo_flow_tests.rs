@@ -2,8 +2,9 @@
 //!
 //! Proves the headless half of the vertical slice's pipeline:
 //! Provider -> ProviderHost (discover + poll) -> SensorStore -> snapshot read.
-//! This exercises the same path the Tauri `get_sensor_snapshot` command and the
-//! background `sensors-update` emitter rely on, without requiring a GUI.
+//! This covers the store layer that `get_sensor_snapshot` and the background
+//! `sensors-update` emitter sit on top of; the snapshot assembly layer has its
+//! own tests in `apps/desktop/src-tauri/src/lib.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,11 +95,13 @@ async fn demo_provider_values_change_over_time() {
   };
 
   let first = read(&provider.poll().await.expect("poll succeeds"));
-  tokio::time::sleep(Duration::from_millis(60)).await;
+  // 200ms gives ~1.03° of phase change on the 7 000ms sine — well clear of the
+  // peak/trough where the derivative approaches zero.
+  tokio::time::sleep(Duration::from_millis(200)).await;
   let second = read(&provider.poll().await.expect("poll succeeds"));
 
   assert!(
-    (first - second).abs() > f64::EPSILON,
+    (first - second).abs() > 0.01,
     "demo values should change between polls (got {first} then {second})"
   );
 }

@@ -43,6 +43,8 @@ async fn build_snapshot(store: &SensorStore) -> Vec<SensorReading> {
         value,
         timestamp_ms,
       });
+    } else {
+      tracing::warn!("Sensor {:?} has no descriptor; omitting from snapshot", sensor_id);
     }
   }
 
@@ -115,7 +117,7 @@ pub fn run() {
     Arc::new(Box::new(mock_provider));
   host
     .write()
-    .unwrap()
+    .expect("Provider host lock should not be poisoned at startup")
     .register_provider(mock_provider_arc)
     .expect("Failed to register MockProvider");
 
@@ -144,13 +146,24 @@ pub fn run() {
       });
 
       let app_handle = app.handle().clone();
-      tauri::async_runtime::spawn(async move {
+      // Assigned to suppress the unused-must-use warning. Dropping a tokio
+      // JoinHandle detaches the task; it keeps running.
+      let _emitter_handle = tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
           tick.tick().await;
-          let readings = build_snapshot(&store_for_emitter).await;
-          if let Err(e) = app_handle.emit("sensors-update", &readings) {
-            tracing::error!("Failed to emit sensors-update event: {}", e);
+          let store_ref = Arc::clone(&store_for_emitter);
+          // Spawn a child task so a panic in build_snapshot is caught via
+          // JoinError instead of killing the emitter loop.
+          match tokio::spawn(async move { build_snapshot(&store_ref).await }).await {
+            Ok(readings) => {
+              if let Err(e) = app_handle.emit("sensors-update", &readings) {
+                tracing::error!("Failed to emit sensors-update: {}", e);
+              }
+            }
+            Err(e) => {
+              tracing::error!("Emitter snapshot task panicked: {}; skipping tick", e);
+            }
           }
         }
       });
@@ -233,5 +246,107 @@ mod tests {
     let sensors: Vec<SensorInfo> = vec![];
     let json = serde_json::to_string(&sensors).expect("Should serialize empty list");
     assert_eq!(json, "[]");
+  }
+
+  #[test]
+  fn test_sensor_reading_serialization() {
+    let reading = SensorReading {
+      id: "cpu.load".to_string(),
+      name: "CPU Load".to_string(),
+      category: "utilization".to_string(),
+      unit: "percent".to_string(),
+      value: Some(72.5),
+      timestamp_ms: 1712345678000,
+    };
+
+    let json = serde_json::to_string(&reading).expect("Should serialize to JSON");
+    assert!(json.contains("\"id\":\"cpu.load\""));
+    assert!(json.contains("\"value\":72.5"));
+    // Explicit rename overrides the camelCase default — confirm the IPC contract.
+    assert!(json.contains("\"timestampMs\":1712345678000"));
+    assert!(!json.contains("\"timestamp_ms\""));
+  }
+
+  #[test]
+  fn test_sensor_reading_null_value_serialization() {
+    let reading = SensorReading {
+      id: "gpu.temp".to_string(),
+      name: "GPU Temperature".to_string(),
+      category: "temperature".to_string(),
+      unit: "celsius".to_string(),
+      value: None,
+      timestamp_ms: 0,
+    };
+
+    let json = serde_json::to_string(&reading).expect("Should serialize to JSON");
+    assert!(json.contains("\"value\":null"));
+    assert!(json.contains("\"timestampMs\":0"));
+  }
+
+  #[tokio::test]
+  async fn test_build_snapshot_with_polled_sensor() {
+    use astragauge_domain::{SensorDescriptor, SensorId, SensorSample};
+
+    let store = Arc::new(SensorStore::new());
+    let sensor_id = SensorId::new("cpu.load").unwrap();
+
+    store
+      .register_sensor(SensorDescriptor {
+        id: sensor_id.clone(),
+        name: "CPU Load".to_string(),
+        category: "utilization".to_string(),
+        unit: "percent".to_string(),
+        device: None,
+        tags: vec![],
+      })
+      .await
+      .unwrap();
+
+    store
+      .push_sample(SensorSample {
+        sensor_id: sensor_id.clone(),
+        timestamp_ms: 12345,
+        value: Some(42.0),
+      })
+      .await
+      .unwrap();
+
+    let readings = build_snapshot(&store).await;
+
+    assert_eq!(readings.len(), 1);
+    let r = &readings[0];
+    assert_eq!(r.id, "cpu.load");
+    assert_eq!(r.value, Some(42.0));
+    assert_eq!(r.timestamp_ms, 12345);
+    assert_eq!(r.unit, "percent");
+  }
+
+  #[tokio::test]
+  async fn test_build_snapshot_unpolled_sensor_returns_null() {
+    use astragauge_domain::{SensorDescriptor, SensorId};
+
+    let store = Arc::new(SensorStore::new());
+    let sensor_id = SensorId::new("cpu.temperature").unwrap();
+
+    store
+      .register_sensor(SensorDescriptor {
+        id: sensor_id.clone(),
+        name: "CPU Temperature".to_string(),
+        category: "temperature".to_string(),
+        unit: "celsius".to_string(),
+        device: None,
+        tags: vec![],
+      })
+      .await
+      .unwrap();
+
+    // No push_sample — sensor registered but not yet polled.
+    let readings = build_snapshot(&store).await;
+
+    assert_eq!(readings.len(), 1);
+    let r = &readings[0];
+    assert_eq!(r.id, "cpu.temperature");
+    assert_eq!(r.value, None);
+    assert_eq!(r.timestamp_ms, 0);
   }
 }
